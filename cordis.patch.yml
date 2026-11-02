@@ -1,0 +1,8 @@
+# dsh-explore-tree bundle patch.
+#
+# 整个插件挂在一行上，空配置永远可用（所有配置项都有安全默认值）。
+# 组合层配置示例见 README「配置」一节；设置页里的用户层会覆盖同名项。
+- insert:
+    - id: explore-tree
+      name: dsh-explore-tree
+      config: {}

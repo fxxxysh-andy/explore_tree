@@ -1,0 +1,11 @@
+node_modules/
+.explore-tree/
+.office/
+.tmp/
+.tmp-*
+*.log
+.DS_Store
+.env
+.env.*
+*.key
+*_key.txt
