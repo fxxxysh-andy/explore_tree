@@ -194,6 +194,88 @@ test('陈旧 graph.lock 会被清理并获得锁', async (t) => {
     await store.close();
 });
 
+test('stat 报告锁不存在时不得删除随后重建的新锁（竞争窗口）', async (t) => {
+    const root = tempRoot(t);
+    const store = new WorkspaceGraphStore({ root, flushDelayMs: 60_000 });
+    await store.open();
+    const lockFile = path.join(root, '.explore-tree', 'graph.lock');
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: 424242, token: 'rival', at: new Date().toISOString() }), 'utf8');
+    const originalStat = fsp.stat;
+    const originalRm = fsp.rm;
+    let injected = false;
+    let earlyRm = 0;
+    const releaseAt = Date.now() + 200;
+    fsp.stat = async function patchedStat(file, ...rest) {
+        if (!injected && String(file) === lockFile) {
+            injected = true;
+            // 模拟「stat 看到锁刚被删掉」的窗口：文件其实已被对手进程重新创建。
+            const error = new Error(`ENOENT: no such file or directory, stat '${file}'`);
+            error.code = 'ENOENT';
+            throw error;
+        }
+        return originalStat.call(this, file, ...rest);
+    };
+    fsp.rm = async function patchedRm(file, options) {
+        if (String(file) === lockFile && Date.now() < releaseAt) earlyRm += 1;
+        return originalRm.call(this, file, options);
+    };
+    const timer = setTimeout(() => fs.rmSync(lockFile, { force: true }), 200);
+    try {
+        const result = await store.apply({ t: 'addNode', node: { kind: 'goal', title: 'G' } });
+        assert.equal(result.node.kind, 'goal');
+        assert.ok(Date.now() >= releaseAt, '必须等对手进程真正释放锁后才能进入临界区');
+        assert.equal(earlyRm, 0, 'stat 说锁不存在时不得按旧判断 rm，可能删掉别人刚重建的新锁');
+    } finally {
+        clearTimeout(timer);
+        fsp.stat = originalStat;
+        fsp.rm = originalRm;
+        await store.close();
+    }
+});
+
+test('观察到陈旧锁但 rm 前已被新持有者重建时不得删除', async (t) => {
+    const root = tempRoot(t);
+    const store = new WorkspaceGraphStore({ root, flushDelayMs: 60_000 });
+    await store.open();
+    const lockFile = path.join(root, '.explore-tree', 'graph.lock');
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: 111, token: 'stale-holder', at: new Date().toISOString() }), 'utf8');
+    const old = new Date(Date.now() - 30_000);
+    fs.utimesSync(lockFile, old, old);
+    const originalStat = fsp.stat;
+    const originalRm = fsp.rm;
+    let injected = false;
+    let earlyRm = 0;
+    const releaseAt = Date.now() + 200;
+    fsp.stat = async function patchedStat(file, ...rest) {
+        if (!injected && String(file) === lockFile) {
+            injected = true;
+            // 第一次 stat 看到的是陈旧锁；紧接着另一个清理者/新持有者已把它替换成新鲜的锁。
+            const fresh = JSON.stringify({ pid: 222, token: 'fresh-holder', at: new Date().toISOString() });
+            fs.writeFileSync(lockFile, fresh, 'utf8');
+            const now = new Date();
+            fs.utimesSync(lockFile, now, now);
+            return { mtimeMs: Date.now() - 30_000, size: Buffer.byteLength(fresh), isFile: () => true };
+        }
+        return originalStat.call(this, file, ...rest);
+    };
+    fsp.rm = async function patchedRm(file, options) {
+        if (String(file) === lockFile && Date.now() < releaseAt) earlyRm += 1;
+        return originalRm.call(this, file, options);
+    };
+    const timer = setTimeout(() => fs.rmSync(lockFile, { force: true }), 200);
+    try {
+        const result = await store.apply({ t: 'addNode', node: { kind: 'goal', title: 'G' } });
+        assert.equal(result.node.kind, 'goal');
+        assert.ok(Date.now() >= releaseAt, '必须等新持有者真正释放锁后才能进入临界区');
+        assert.equal(earlyRm, 0, 'rm 前锁已被替换，不能按旧 stat 删掉新持有者的锁');
+    } finally {
+        clearTimeout(timer);
+        fsp.stat = originalStat;
+        fsp.rm = originalRm;
+        await store.close();
+    }
+});
+
 test('open 抛瞬时 EPERM 时重试而不是让写进程失败', async (t) => {
     const root = tempRoot(t);
     const store = new WorkspaceGraphStore({ root, flushDelayMs: 60_000 });

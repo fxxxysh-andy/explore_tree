@@ -22,6 +22,15 @@ jobs:
         with:
           node-version: 24
 
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME 与 package.json v$version 不一致" >&2
+            exit 1
+          fi
+
       - name: Syntax check
         run: npm run check
 

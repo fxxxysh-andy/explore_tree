@@ -19,13 +19,15 @@ import { buildToolDefinitions } from '../../src/host/tools.js';
 import { detectArtifacts, translateSessionEvent } from '../../src/host/translate.js';
 import { PROMPT_TEXT } from '../../src/host/prompt.js';
 import { fingerprint } from '../../src/core/fingerprint.js';
+import { canonicalWorkspaceRoot } from '../../src/core/paths.js';
 
 const tempRoots = [];
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'explore-tree-dsh-home-'));
 function makeWorkspace() {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'explore-tree-host-'));
     tempRoots.push(root);
-    return root;
+    // Windows runner 的 TEMP 常是 8.3 短路径；用例统一用 realpath，避免拿别名去比 canonical root。
+    return canonicalWorkspaceRoot(root) ?? root;
 }
 
 after(() => {
@@ -321,6 +323,33 @@ describe('ResearchTraceService', () => {
 
             const denied = await httpGet(service, `/explore-tree/snapshot?workspace=${encodeURIComponent(root)}`, '10.0.0.7');
             assert.equal(denied.status, 403);
+        } finally {
+            await service.dispose();
+        }
+    });
+
+    it('别名/短路径访问同一工作区时复用 canonical store', async () => {
+        const root = makeWorkspace();
+        const aliasParent = fs.mkdtempSync(path.join(os.tmpdir(), 'explore-tree-alias-'));
+        tempRoots.push(aliasParent);
+        const alias = path.join(aliasParent, 'workspace-alias');
+        fs.symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+        const { ctx } = mockContext(root);
+        const service = new ResearchTraceService(ctx, normalizeConfig({}), silentLogger);
+        try {
+            const session = makeSession('s-alias', root);
+            await service.ingestSessionEvent(session, {
+                type: 'user/message',
+                data: { content: [{ type: 'text', text: '目标：别名路径也要看到同一张图' }] },
+            });
+            const snap = await service.snapshotFor(alias);
+            assert.equal(snap.workspace.root, root, '快照应归一到 canonical root');
+            assert.ok(snap.nodes.length >= 1);
+
+            const viaHttp = await httpGet(service, `/explore-tree/snapshot?workspace=${encodeURIComponent(alias)}`);
+            assert.equal(viaHttp.status, 200);
+            assert.equal(viaHttp.body.workspace.root, root);
+            assert.equal(viaHttp.body.nodes.length, snap.nodes.length, '两种路径应读同一张图');
         } finally {
             await service.dispose();
         }

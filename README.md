@@ -391,16 +391,16 @@ src/
     tools.js          两个工具定义与执行
     prompt.js         静态提示段
     config.js         配置归一化
-lib/client.js         浏览器 bundle（手写，无构建；conversation.view 页签 + settings.section 设置页）
+lib/client.js         浏览器 bundle（手写，无构建；conversation.view 页签 + settings.section 设置分区）
 docs/design.md        设计契约
 scripts/              install / status / smoke / uninstall（e2e）+ audit-graph / rebuild / migrate-trunk（旧图体检、修复、主干迁移）
-test/unit/            node:test 单测（172 项，13 suites）
+test/unit/            node:test 单测（177 项，13 suites）
 ```
 
 ## 9. 开发与测试
 
 ```powershell
-npm test                 # node --test "test/unit/*.test.js"，172 项
+npm test                 # node --test "test/unit/*.test.js"，177 项
 node --check lib/client.js
 node --check src/index.js
 
@@ -412,6 +412,18 @@ node scripts/uninstall.mjs --profile explore-scratch
 # 线上 GUI 只读体检（不重启、不刷新页面）
 node scripts/status.mjs --profile web
 node scripts/smoke.mjs --profile web --base http://127.0.0.1:3080 --path /explore-tree/health
+```
+
+### 发布 Release
+
+`.github/workflows/release.yml` 在推送 `v*` tag 时运行：先校验 tag 与 `package.json` 版本一致，
+再跑 `npm run check` / `npm test` / `npm pack`，最后由 `softprops/action-gh-release` 创建
+Release 并上传 tarball。tag 与版本不一致会在打包前直接失败。
+
+```powershell
+# 先提交版本号与 CHANGELOG，再打 tag 推送；版本号必须与 tag 去掉 v 后一致
+git tag v0.23.1
+git push origin main v0.23.1
 ```
 
 ### 旧图体检、修复与主干迁移（P3/P2）
@@ -450,7 +462,10 @@ artifact 根挂回会话 goal；重复 step 合并子树与边；旧 note 打 `l
   跨域返回 `OUT_OF_SCOPE`，租约过期返回 `LEASE_EXPIRED`；`lead/curator` 例外。
   不传 `actor` 时保持 0.18 的兼容路径（不启用写域校验）。
 - **跨进程（v0.19）**：同一工作区的写用 `.explore-tree/graph.lock` 串行化；锁内先重读快照与
-  journal 再应用，`journalOffset` 记录真实字节数，半行/坏行告警后停在可重试点。
+  journal 再应用，`journalOffset` 记录真实字节数，半行/坏行告警后停在可重试点。瞬时
+  EPERM/EBUSY 与锁文件 delete-pending 窗口按竞争重试，不会误删其他进程的活锁。
+- **锁竞争（v0.23.1）**：`stat` 瞬时报告锁不存在时只重试、不删除；清理陈旧锁前二次核对
+  mtime/size；等待退避 5–15ms 随机并在释放后让出窗口，避免快速写循环饿死对手。
 - **可认领提示**：`trunk` / `brief` 会列「可认领：…」；`frontier` 对过期租约给 `claim` 建议；
   `assign` 后 `owner` 显示在 topic 卡片与 trunk 行里。
 - **交接**：`brief`（≤400 字：目标 / 主干 digest / 其他主干 / 未决叶根 / 下一步）就是交接包；默认 `briefScope=workspace`，接手者能看到同工作区其他 goal 的共享主干，不再只看见自己 goal 的碎片；

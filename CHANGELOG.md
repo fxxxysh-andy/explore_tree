@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.23.1 — 2026-11-03
+
+### 修复（v0.23.0 Release 失败与并发锁竞争）
+
+- **Windows 8.3/别名路径不再分裂工作区**：`ResearchTraceService.snapshotFor` 先用
+  `canonicalWorkspaceRoot` 归一化再取 store；浏览器的短路径/别名访问与工具写入命中同一张图。
+  host 测试的临时工作区统一返回 canonical 路径，并新增 junction 别名回归（快照 root、HTTP 节点数一致）。
+- **graph.lock 竞争不再误删活锁**：`#acquireLock` 在 EEXIST 后 `stat` 瞬时失败/ENOENT 时
+  不再删除锁文件（删除会删掉其他进程刚重建或仍持有的锁，导致重复 id、journal 覆盖与丢节点）；
+  陈旧锁清理前二次 `stat` 核对 mtime/size，防止观察后被新持有者替换。
+- **锁等待公平性**：EEXIST 退避由固定 25ms 改为 5–15ms 随机；本次取锁发生过竞争的进程
+  在释放后让出 0–3ms，避免快速 apply 循环连续抢回、把对手饿到 2s 超时。
+- **release workflow 校验 tag 与版本**：推 `v*` tag 后先比较 `GITHUB_REF_NAME` 与
+  `package.json` 版本，不一致在语法检查/测试前失败，避免打出错版本的 Release。
+- **设置页偏好跨标签页同步**：监听 `storage` 事件刷新 `explore-tree.prefs.v1`；聚焦已关闭节点时
+  保持其高亮，不再强制关闭「只看未决」。
+
+### 验证
+
+- 定向：`host.test.js` 32/32（含别名回归）、`store.test.js` 15/15（新增 2 条竞争窗口用例）、
+  `client.test.js` 6/6。
+- npm test：177 项 / 13 suites 全过；`npm run check`、`git diff --check` 通过。
+- 说明：v0.23.0 的 Actions run 41474049905 在 Windows runner 上因 8.3 短路径 4 项 host 测试失败，
+  未生成 Release；本版为修复后的重发版本。
+- 残余风险：16 个 writer 同机饱和时，2s 锁等待仍可能出现调度超时（单工作区 2 writer×40 ops×50 轮
+  零失败）；暂不把上限提到 5s，保留超时错误作为真实卡死的诊断信号。
+
 ## 0.23.0 — 2026-11-02
 
 ### 新增（设置页 + release workflow）

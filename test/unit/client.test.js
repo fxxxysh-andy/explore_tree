@@ -15,7 +15,7 @@ import { describe, it } from 'node:test';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bundlePath = path.resolve(here, '../../lib/client.js');
 
-function loadBundle() {
+function loadBundle(options = {}) {
     const source = fs.readFileSync(bundlePath, 'utf8');
     const registered = [];
     const sandbox = {
@@ -29,10 +29,24 @@ function loadBundle() {
         console,
         fetch: () => Promise.reject(new Error('no network in unit test')),
     };
+    if (options.localStorage !== undefined) {
+        sandbox.localStorage = {
+            getItem(key) { return options.localStorage.has(key) ? options.localStorage.get(key) : null; },
+            setItem(key, value) { options.localStorage.set(key, String(value)); },
+        };
+    }
     vm.createContext(sandbox);
     vm.runInContext(source, sandbox, { filename: bundlePath });
     assert.equal(registered.length, 1, 'bundle 必须只调用一次 __ModuleLoader__.load');
     return registered[0];
+}
+
+function findAll(node, predicate, found = []) {
+    if (node === null || typeof node !== 'object') return found;
+    if (predicate(node)) found.push(node);
+    const children = Array.isArray(node.children) ? node.children : [];
+    for (const child of children) findAll(child, predicate, found);
+    return found;
 }
 
 function reactStub() {
@@ -135,5 +149,50 @@ describe('lib/client.js bundle contract', () => {
             assert.ok(json.includes(text), '设置页应包含「' + text + '」');
         }
         assert.ok(!json.includes('正在读取研究图'), '设置页不应触发面板请求/加载态');
+    });
+
+    it('设置页开关写入 localStorage，重新渲染立即生效', () => {
+        const storage = new Map();
+        const registration = loadBundle({ localStorage: storage });
+        const module = registration.factory(() => reactStub());
+        let settingsEntry;
+        module.apply({
+            slots: {
+                inject(name, factory) {
+                    if (name === 'settings.section') settingsEntry = factory();
+                },
+                register(options, component) { return { options, component }; },
+            },
+        });
+        const toggle = (tree, title) => findAll(tree, (node) => (
+            typeof node.type === 'function' && node.type.name === 'ToggleRow' && node.props.title === title
+        ))[0];
+        let tree = settingsEntry.component({});
+        const auto = toggle(tree, '自动刷新');
+        assert.equal(auto.props.checked, true);
+        auto.props.onChange(false);
+        tree = settingsEntry.component({});
+        assert.equal(toggle(tree, '自动刷新').props.checked, false, '关闭后重新渲染应反映新值');
+        assert.equal(JSON.parse(storage.get('explore-tree.prefs.v1')).autoRefresh, false, '偏好应持久化');
+        auto.props.onChange(true);
+        assert.equal(JSON.parse(storage.get('explore-tree.prefs.v1')).autoRefresh, true);
+    });
+
+    it('损坏的 localStorage 回退默认值', () => {
+        const storage = new Map([['explore-tree.prefs.v1', '{not json']]);
+        const registration = loadBundle({ localStorage: storage });
+        const module = registration.factory(() => reactStub());
+        let settingsEntry;
+        module.apply({
+            slots: {
+                inject(name, factory) {
+                    if (name === 'settings.section') settingsEntry = factory();
+                },
+                register(options, component) { return { options, component }; },
+            },
+        });
+        const tree = settingsEntry.component({});
+        const auto = findAll(tree, (node) => typeof node.type === 'function' && node.type.name === 'ToggleRow' && node.props.title === '自动刷新')[0];
+        assert.equal(auto.props.checked, true, '损坏值不应影响默认偏好');
     });
 });

@@ -348,8 +348,12 @@ is there、did/do/does + 双词主语、should + 名词主语、中文中置疑�
     宽度隐藏只动自动完成项。
   - **v0.23.0**：面板显示/过滤开关移入 `settings.section` —— 新增「研究轨迹」设置分区，
     偏好统一存 `explore-tree.prefs.v1` 并由面板/设置页共享；工具栏只留画布操作。新增
-    `.github/workflows/release.yml`：推 `v*` tag 时在 windows-latest 跑语法检查、172 项单测、
+    `.github/workflows/release.yml`：推 `v*` tag 时在 windows-latest 跑语法检查、177 项单测、
     `npm pack` 并创建 GitHub Release（附带 tarball）。
+  - **v0.23.1**：v0.23.0 Release 失败修复——`snapshotFor` 先 canonical 化工作区路径，避免 Windows
+    8.3/别名路径读到另一个 store；`graph.lock` 的 `stat` 瞬时 ENOENT 不再删除活锁，陈旧锁清理前
+    二次核对 mtime/size，等待改为 5–15ms 随机退避并对竞争过的释放让出 0–3ms；release workflow
+    增加 tag 与 package 版本一致性校验；设置页偏好监听 `storage` 跨标签页同步。
   - 未做：多 agent 对照实验（H4 协议已预注册）；自动提取仍不启用租约写域（只做归属，不阻断）。
 
 ### 6.5 归档与摘要版本（v0.17）
@@ -416,13 +420,13 @@ is there、did/do/does + 双词主语、should + 名词主语、中文中置疑�
   - 「主干 / 研究」切换：主干视图只保留 goal/topic 与直接挂在 topic 下的叶根，时间桶 step 隐藏；
     研究视图保留全部节点。topic 卡片显示 digest、主题进度（叶 done/total）与 owner；
     详情栏显示「摘要 · 父节点是子节点摘要的摘要」。
-  - 工具栏两行：①标题、工作区、节点/想法/未决/关系/层深统计 + `折叠` `展开` `适应宽度` `最新`、
+  - 工具栏：①标题、工作区、节点/想法/未决/关系/层深统计 + `折叠` `展开` `适应宽度` `最新`、
     缩放组（20%–160%）与 `刷新`，并提示「显示选项在 设置 → 研究轨迹」；②搜索（标题/摘要/标签，`下一个` 自动展开祖先）+
-    轮次 chips（`第 N 轮 · 子节点数`）；③按 kind 的图例计数。
+    轮次 chips（`第 N 轮 · 子节点数`）与按 kind 的图例计数。
   - 设置页「研究轨迹」分区（`settings.section`，id `explore-tree`，order 518）：显示组 `autoRefresh`
     `compact` `showOutline` `showInspector`，过滤组 `hideActions` `hideArtifacts` `hideNotes`
     `onlyOpen` `onlySession`；偏好存 `localStorage` 的 `explore-tree.prefs.v1`，面板与设置页通过订阅实时同步，
-    「恢复默认」只重置偏好、不碰图数据。
+    其他标签页改动由 `storage` 事件跟进；「恢复默认」只重置偏好、不碰图数据。
 - 详情栏长摘要默认折叠为「摘要 + 展开全文 · N 字」；LLM 节点卡片带 `AI` 标记。
 - 左：**大纲**（目标 + 每轮标题与子树计数，点击定位，可在设置页关闭）。中：自上而下的**卡片树**（父卡在上、
     子卡在下，贝塞尔连线，选中路径高亮；卡片含 kind 徽标、标题、摘要、状态、**子树统计**与折叠按钮）。

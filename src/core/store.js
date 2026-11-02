@@ -91,6 +91,7 @@ export class WorkspaceGraphStore extends EventEmitter {
         this.appliedJournalBytes = 0;
         this.loadedStamp = null;
         this.lockDepth = 0;
+        this.lockContended = false;
         this.lockToken = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
         this.reloads = 0;
         this.lastFlushAt = null;
@@ -391,6 +392,7 @@ export class WorkspaceGraphStore extends EventEmitter {
                 // ENOENT 表示锁刚被释放。都按「稍后重试」处理，不能把写进程直接打崩。
                 if (!LOCK_CONTENTION_CODES.has(error.code)) throw error;
                 lastError = error;
+                this.lockContended = true;
                 let stat = null;
                 try {
                     stat = await fsp.stat(this.lockFile);
@@ -398,22 +400,24 @@ export class WorkspaceGraphStore extends EventEmitter {
                     stat = null;
                 }
                 if (stat === null) {
-                    // 锁已不存在（刚释放/删除挂起）：EEXIST 保留原有清理告警并立即重试；
-                    // 其余错误码稍等再试，避免 EPERM + 锁文件不存在时的热循环。
-                    if (error.code === 'EEXIST') {
-                        try {
-                            await fsp.rm(this.lockFile, { force: true });
-                            this.logger.warn('清理陈旧的 graph.lock（持有者可能已崩溃）。');
-                            retryImmediately = true;
-                            continue;
-                        } catch {
-                            // 竞争下别人已清理；稍后重试。
-                        }
-                    }
+                    // stat 的瞬间锁不存在（刚释放/删除挂起）。这里不能 rm：stat 与 rm 之间
+                    // 另一个进程可能已经创建了新锁，按旧判断 rm 会删掉活锁，让两个进程同时
+                    // 进入临界区，进而产生重复 id、journal 覆盖和丢节点（v0.23.0 的 flaky）。
+                    // 文件本来就不存在，没有需要清理的对象；稍等再试，也避免绕过等待上界。
                     await sleep(5);
                     continue;
                 }
                 if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+                    // 删除前重新确认：从上面这个 stat 到 rm 之间，陈旧锁可能已被别的清理者
+                    // 删掉并由新持有者重建。只有仍是同一把陈旧锁（mtime/size 未变）才删。
+                    let stillStale = null;
+                    try {
+                        stillStale = await fsp.stat(this.lockFile);
+                    } catch {
+                        stillStale = null;
+                    }
+                    if (stillStale === null) continue;
+                    if (stillStale.mtimeMs !== stat.mtimeMs || stillStale.size !== stat.size) continue;
                     try {
                         await fsp.rm(this.lockFile, { force: true });
                         this.logger.warn('清理陈旧的 graph.lock（持有者可能已崩溃）。');
@@ -425,7 +429,9 @@ export class WorkspaceGraphStore extends EventEmitter {
                     await sleep(5);
                     continue;
                 }
-                await sleep(25);
+                // 5–15ms 随机退避：固定 25ms 会让等待者与持有者的释放/重抢节奏锁相，
+                // 在快速 apply 循环里把对手饿到 2s 超时。随机抖动打破这种锁相。
+                await sleep(5 + Math.floor(Math.random() * 11));
             }
         }
     }
@@ -436,13 +442,22 @@ export class WorkspaceGraphStore extends EventEmitter {
             return;
         }
         this.lockDepth = 0;
+        const contended = this.lockContended;
+        this.lockContended = false;
+        let released = false;
         try {
             const text = await fsp.readFile(this.lockFile, 'utf8');
             const parsed = JSON.parse(text);
-            if (parsed?.token === this.lockToken) await fsp.rm(this.lockFile, { force: true });
+            if (parsed?.token === this.lockToken) {
+                await fsp.rm(this.lockFile, { force: true });
+                released = true;
+            }
         } catch {
             // 锁文件已不存在/被接管：不删除别人的锁。
         }
+        // 本次取锁曾发生竞争时，释放后让出 0–3ms，给等待者一个抢锁窗口；
+        // 否则快速 apply 循环会由同一进程连续抢回，把对手饿到 LOCK_WAIT_MS 超时。
+        if (released && contended) await sleep(Math.random() * 3);
     }
 
     /** 在锁内吸收磁盘上别人的进度；返回是否发生了重载。 */

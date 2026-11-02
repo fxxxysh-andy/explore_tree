@@ -617,7 +617,9 @@ export class ResearchTraceService {
 
     /** 完整快照（浏览器面板 + 可能的调试）。 */
     async snapshotFor(root, options = {}) {
-        const store = await this.registry.get(root);
+        // 浏览器可能带着 8.3/别名/不同大小写的路径来；registry 以 canonical root 为键。
+        // 不在这里归一化，就会读到另一个 store，出现「工具写了但快照没有」。
+        const store = await this.registry.get(canonicalWorkspaceRoot(root) ?? root);
         await this.#compactLegacyActions(store);
         await this.#repairOrphanSteps(store);
         await this.#expandLegacyAnswers(store);
