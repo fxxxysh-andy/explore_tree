@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.23.0 — 2026-11-02
+
+### 新增（设置页 + release workflow）
+
+- **面板开关移入设置页**：新增 `settings.section`「研究轨迹」分区（id `explore-tree`，order 518），
+  提供显示组（自动刷新、紧凑模式、大纲、详情栏）与过滤组（隐藏动作、隐藏产物、隐藏笔记、
+  只看未决、仅本会话）以及「恢复默认」。偏好存 `localStorage` 的 `explore-tree.prefs.v1`，
+  面板与设置页通过订阅实时同步；面板工具栏只保留主干/研究、折叠/展开、适应宽度、最新、缩放、
+  刷新、搜索与轮次定位，并提示设置入口。
+- **GitHub Actions release**：新增 `.github/workflows/release.yml`，推 `v*` tag 时在
+  `windows-latest` 上依次执行 `npm run check`、`npm test`、`npm pack`，由
+  `softprops/action-gh-release@v2` 创建 Release 并附带 `*.tgz`。
+
+### 验证
+
+- `client.test.js` 扩展为双槽位注册、面板不再含已移走的开关、设置分区渲染断言。
+- npm test：172 项 / 13 suites 全过；`npm run check`、`git diff --check` 通过。
+
 ## 0.22.1 — 2026-11-02
 
 ### 修复（对 0.21.0 未决卫生的审查收口）
@@ -704,3 +722,4 @@
 - 后台 LLM 辅助提取（`config.llm.enabled`）为预留开关，未实现。
 - 多宿主进程同写一个工作区按最后写入者赢，不做分布式锁。
 - 面板只读，无缩放/拖拽/折叠。
+

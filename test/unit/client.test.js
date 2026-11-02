@@ -62,7 +62,7 @@ describe('lib/client.js bundle contract', () => {
         assert.equal(typeof module.apply, 'function');
     });
 
-    it('只注册 conversation.view 上栏页签（不再有顶栏按钮/弹层）', () => {
+    it('注册 conversation.view 页签与 settings.section 设置分区', () => {
         const registration = loadBundle();
         const module = registration.factory(() => reactStub());
         const injected = [];
@@ -73,8 +73,8 @@ describe('lib/client.js bundle contract', () => {
             },
         };
         module.apply(ctx);
-        assert.equal(injected.length, 1);
-        assert.equal(injected[0].name, 'conversation.view');
+        assert.equal(injected.length, 2);
+        assert.deepEqual(injected.map((item) => item.name), ['conversation.view', 'settings.section']);
         const view = injected[0].entry;
         assert.equal(view.options.name, 'conversation.view');
         assert.equal(view.options.id, 'explore-tree');
@@ -82,6 +82,13 @@ describe('lib/client.js bundle contract', () => {
         assert.equal(typeof view.options.label, 'function');
         assert.equal(view.options.label(), '研究轨迹');
         assert.equal(typeof view.component, 'function');
+        const settings = injected[1].entry;
+        assert.equal(settings.options.name, 'settings.section');
+        assert.equal(settings.options.id, 'explore-tree');
+        assert.equal(settings.options.order, 518);
+        assert.equal(typeof settings.options.label, 'function');
+        assert.equal(settings.options.label(), '研究轨迹');
+        assert.equal(typeof settings.component, 'function');
     });
 
     it('面板在空数据下渲染标题与加载态，不抛错', () => {
@@ -100,10 +107,33 @@ describe('lib/client.js bundle contract', () => {
         const tree = viewEntry.component({ sessionId: 's1', useSessions: undefined });
         const json = JSON.stringify(tree);
         assert.ok(json.includes('研究轨迹'), '面板标题必须出现');
-        assert.ok(json.includes('自动刷新'), '刷新开关必须出现');
         assert.ok(json.includes('正在读取研究图'), '首帧必须显示加载态而不是空白/崩溃');
         assert.ok(json.includes('当前会话工作区'), '未解析出会话工作区时显示占位名');
+        assert.ok(json.includes('显示选项在 设置 → 研究轨迹'), '面板要提示偏好已移到设置页');
+        assert.ok(!json.includes('自动刷新'), '自动刷新已移到设置页，不应再出现在工具栏');
+        assert.ok(!json.includes('隐藏动作'), '隐藏动作已移到设置页');
+        assert.ok(!json.includes('只看未决'), '只看未决已移到设置页');
         assert.ok(!json.includes('工作目录路径'), '工作区不再需要手动选择/输入');
         assert.ok(!json.includes('打开'), '不再有路径输入与打开按钮');
+    });
+
+    it('设置分区渲染显示/过滤偏好与恢复默认', () => {
+        const registration = loadBundle();
+        const module = registration.factory(() => reactStub());
+        let settingsEntry;
+        module.apply({
+            slots: {
+                inject(name, factory) {
+                    if (name === 'settings.section') settingsEntry = factory();
+                },
+                register(options, component) { return { options, component }; },
+            },
+        });
+        const tree = settingsEntry.component({});
+        const json = JSON.stringify(tree);
+        for (const text of ['研究轨迹', '显示', '过滤', '自动刷新', '紧凑模式', '大纲', '详情栏', '隐藏动作', '隐藏产物', '隐藏笔记', '只看未决', '仅本会话', '恢复默认']) {
+            assert.ok(json.includes(text), '设置页应包含「' + text + '」');
+        }
+        assert.ok(!json.includes('正在读取研究图'), '设置页不应触发面板请求/加载态');
     });
 });

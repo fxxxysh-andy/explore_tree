@@ -346,6 +346,10 @@ is there、did/do/does + 双词主语、should + 名词主语、中文中置疑�
     `cleanTitle` 去问号后仍按疑问句保留；blocker 在分类与收敛两侧豁免；`auto-curated` 不计入
     死路与「放弃」增量；主题满仓时单条想法也可另起候选主题；顶栏与面板共用 `openUnresolved`；
     宽度隐藏只动自动完成项。
+  - **v0.23.0**：面板显示/过滤开关移入 `settings.section` —— 新增「研究轨迹」设置分区，
+    偏好统一存 `explore-tree.prefs.v1` 并由面板/设置页共享；工具栏只留画布操作。新增
+    `.github/workflows/release.yml`：推 `v*` tag 时在 windows-latest 跑语法检查、172 项单测、
+    `npm pack` 并创建 GitHub Release（附带 tarball）。
   - 未做：多 agent 对照实验（H4 协议已预注册）；自动提取仍不启用租约写域（只做归属，不阻断）。
 
 ### 6.5 归档与摘要版本（v0.17）
@@ -412,11 +416,15 @@ is there、did/do/does + 双词主语、should + 名词主语、中文中置疑�
   - 「主干 / 研究」切换：主干视图只保留 goal/topic 与直接挂在 topic 下的叶根，时间桶 step 隐藏；
     研究视图保留全部节点。topic 卡片显示 digest、主题进度（叶 done/total）与 owner；
     详情栏显示「摘要 · 父节点是子节点摘要的摘要」。
-  - 三行工具栏：①标题、工作区、节点/想法/未决/关系/层深统计 + `折叠` `展开` `适应宽度` `最新` `大纲`
-    缩放组（20%–160%）`紧凑` `详情` `刷新` `自动刷新`；②搜索（标题/摘要/标签，`下一个` 自动展开祖先）+
-    `隐藏动作` `隐藏产物` `隐藏笔记` `只看未决` `本会话` + 轮次 chips（`第 N 轮 · 子节点数`）；③按 kind 的图例计数。
+  - 工具栏两行：①标题、工作区、节点/想法/未决/关系/层深统计 + `折叠` `展开` `适应宽度` `最新`、
+    缩放组（20%–160%）与 `刷新`，并提示「显示选项在 设置 → 研究轨迹」；②搜索（标题/摘要/标签，`下一个` 自动展开祖先）+
+    轮次 chips（`第 N 轮 · 子节点数`）；③按 kind 的图例计数。
+  - 设置页「研究轨迹」分区（`settings.section`，id `explore-tree`，order 518）：显示组 `autoRefresh`
+    `compact` `showOutline` `showInspector`，过滤组 `hideActions` `hideArtifacts` `hideNotes`
+    `onlyOpen` `onlySession`；偏好存 `localStorage` 的 `explore-tree.prefs.v1`，面板与设置页通过订阅实时同步，
+    「恢复默认」只重置偏好、不碰图数据。
 - 详情栏长摘要默认折叠为「摘要 + 展开全文 · N 字」；LLM 节点卡片带 `AI` 标记。
-- 左：**大纲**（目标 + 每轮标题与子树计数，点击定位，可收起）。中：自上而下的**卡片树**（父卡在上、
+- 左：**大纲**（目标 + 每轮标题与子树计数，点击定位，可在设置页关闭）。中：自上而下的**卡片树**（父卡在上、
     子卡在下，贝塞尔连线，选中路径高亮；卡片含 kind 徽标、标题、摘要、状态、**子树统计**与折叠按钮）。
     布局按「打包行」放置：同一父节点的子卡超出一行宽度（约 920px）即换行堆叠，父卡居中于子块，
     多个根纵向堆叠，避免宽树被拉成几屏宽；`transform:scale` 实现缩放 + 外层横纵滚动；未手动缩放时
@@ -426,14 +434,14 @@ is there、did/do/does + 双词主语、should + 名词主语、中文中置疑�
     避免误选中卡片；中键拖动同样可用）；选中卡用自算 `scrollLeft/scrollTop` 定位，不再调用
     `scrollIntoView`，避免把整页一起滚动；子节点超过 8 个默认折叠。
     跨轮/跨分支关系（supports/refines/contradicts/continues 等）画成按 kind 着色的虚线，选中端点时高亮。
-  - 右（可收起）：选中时节点详情（kind/status/confidence/summary/tags/refs/关系列表/可点根路径/子节点列表）；
+  - 右（可收起，收起后可在设置页重新打开）：选中时节点详情（kind/status/confidence/summary/tags/refs/关系列表/可点根路径/子节点列表）；
     无选中时图概况（统计、类型分布、未决、根节点）。未决只计 `collectOpenItems().visibleCount`，
     并显示「已折叠 X：旁白 / 旧主题 / 推理细节」，不再把全部 open/active 节点平铺。
     底部 frontier 建议（`<details>` 折叠）与 `avoid` 死路。
-  - 轮询 3s 保留缩放/选中/折叠/大纲状态；`fitWidth` 按画布宽度计算缩放（0.2–1.6），手动缩放后不再自动改；
+  - 轮询 3s 保留缩放/选中/折叠状态；`fitWidth` 按画布宽度计算缩放（0.2–1.6），手动缩放后不再自动改；
     滚轮默认滚动，`Shift+滚轮` 横向滚动，`Ctrl/⌘+滚轮` 以指针为锚点缩放；画布 `overscroll-behavior:contain`，滚到边界不穿透页面。
 - 默认隐藏 `action` 节点（旧图里有几百个）；旧图 `note`（P0/P1 前的 process 旁白）也默认折叠，
-  工具栏可取消「隐藏笔记」。可见子节点就近挂到未隐藏祖先，不破坏树形。
+  可在设置页取消「隐藏笔记」。可见子节点就近挂到未隐藏祖先，不破坏树形。
 - 首帧在数据到达前显示「正在读取研究图…」；画布对空数据防御，不因瞬时无快照而崩溃。
   布局契约沿用客户端 API 调研 §5.3（页签不自建纵向滚动容器）。
 - 数据：`GET /explore-tree/workspaces` + `GET /explore-tree/snapshot?workspace=…`，
@@ -550,7 +558,7 @@ children?（add 时一次建一层子节点，≤20）
     service 摄取/HTTP/非本机 403、全局工作区索引、历史会话回放补建（reasoning → 想法节点，幂等）、
     工具读写、插件装配；P0：注入消息不建 goal 且真实消息回填轮次标题、midway step 被 turn/start
     复用、同轮重复 step 快照期迁移合并、present 交付物落 artifact。
-  - `client.test.js`：bundle id/inject、单槽位注册（conversation.view）、
+  - `client.test.js`：bundle id/inject、双槽位注册（conversation.view + settings.section）、
     首帧加载态。
   - `prefix.test.js`：提示段静态、图变化前后工具面逐字节稳定、动态状态只走返回值。
 - E2E（`scripts/`，scratch profile 不碰主 profile）：

@@ -1,6 +1,6 @@
 {
   "name": "dsh-explore-tree",
-  "version": "0.22.1",
+  "version": "0.23.0",
   "description": "研究轨迹：以树状结构记录大模型研究工作区的研究图，提供观测工具、探索建议与 DSH 内可视化。",
   "type": "module",
   "main": "src/index.js",
