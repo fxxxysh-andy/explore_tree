@@ -145,7 +145,7 @@ test('turn/start 重复投递时只建一个 step', async (t) => {
     assert.equal(steps.length, 1);
 });
 
-test('推理里的关键想法有层级：假设下的证据挂到假设节点', async (t) => {
+test('ranked：无关证据不再错挂到最近假设（回归）', async (t) => {
     const { store, extractor } = setup(t);
     await extractor.handle({ type: 'user.message', sessionId: SESSION, text: '研究图要取关键节点' });
     await extractor.handle({ type: 'turn.start', sessionId: SESSION, turn: 1 });
@@ -156,12 +156,92 @@ test('推理里的关键想法有层级：假设下的证据挂到假设节点',
         text: '假设：工具调用聚合后仍会丢信息，因为失败路径需要单独保留。\n\n证据：live 图里 note 有 53 个，说明旁白没有被过滤。',
     });
     const nodes = [...store.state.nodes.values()];
+    const step = nodes.find((node) => node.kind === 'step');
     const hypothesis = nodes.find((node) => node.kind === 'hypothesis');
     const evidence = nodes.find((node) => node.kind === 'evidence');
     assert.ok(hypothesis, '关键假设要成为节点');
     assert.ok(evidence, '证据句要成为节点');
-    assert.equal(evidence.parentId, hypothesis.id, '证据应挂在假设下，形成多层树');
+    assert.equal(evidence.parentId, step.id, '无关证据应留在 step 下，而不是挂到最近的假设');
+    assert.ok(!store.state.edges.some((edge) => edge.kind === 'supports'), '无关证据不应自动建 supports 边');
 });
+
+test('ranked：跨 assistant.reasoning 事件也不算同段紧邻（回归）', async (t) => {
+    const { store, extractor } = setup(t);
+    await extractor.handle({ type: 'user.message', sessionId: SESSION, text: '研究图要取关键节点' });
+    await extractor.handle({ type: 'turn.start', sessionId: SESSION, turn: 1 });
+    // 同一轮的两个事件：段落号必须跨事件延续，不能重置成「同段」。
+    await extractor.handle({
+        type: 'assistant.reasoning',
+        sessionId: SESSION,
+        turn: 1,
+        text: '假设：工具调用聚合后仍会丢信息，因为失败路径需要单独保留。',
+    });
+    await extractor.handle({
+        type: 'assistant.reasoning',
+        sessionId: SESSION,
+        turn: 1,
+        text: '证据：live 图里 note 有 53 个，说明旁白没有被过滤。',
+    });
+    const nodes = [...store.state.nodes.values()];
+    const step = nodes.find((node) => node.kind === 'step');
+    const evidence = nodes.find((node) => node.kind === 'evidence');
+    assert.ok(evidence, '证据句要成为节点');
+    assert.equal(evidence.parentId, step.id, '跨事件的证据不应挂到上一段的假设下');
+    assert.ok(!store.state.edges.some((edge) => edge.kind === 'supports'), '跨事件证据不应自动建 supports 边');
+});
+
+test('ranked：同一段紧邻证据挂到假设下并连 supports 边', async (t) => {
+    const { store, extractor } = setup(t);
+    await extractor.handle({ type: 'user.message', sessionId: SESSION, text: '研究图要取关键节点' });
+    await extractor.handle({ type: 'turn.start', sessionId: SESSION, turn: 1 });
+    await extractor.handle({
+        type: 'assistant.reasoning',
+        sessionId: SESSION,
+        turn: 1,
+        text: '假设：工具调用聚合后仍会丢信息，因为失败路径需要单独保留。证据：live 图里 note 有 53 个，说明旁白没有被过滤。',
+    });
+    const nodes = [...store.state.nodes.values()];
+    const hypothesis = nodes.find((node) => node.kind === 'hypothesis');
+    const evidence = nodes.find((node) => node.kind === 'evidence');
+    assert.ok(hypothesis, '关键假设要成为节点');
+    assert.ok(evidence, '证据句要成为节点');
+    assert.equal(evidence.parentId, hypothesis.id, '同段紧邻证据应挂在假设下');
+    assert.ok(
+        store.state.edges.some((edge) => edge.kind === 'supports'
+            && edge.from === evidence.id && edge.to === hypothesis.id),
+        '同轮嵌套还应补一条 evidence→hypothesis 的 supports 边',
+    );
+});
+
+test('ranked：typed edge 按语义选择目标，不依赖父子关系（回归）', async (t) => {
+    const { store, extractor } = setup(t);
+    await extractor.handle({ type: 'user.message', sessionId: SESSION, text: '研究缓存键与用户维度' });
+    await extractor.handle({ type: 'turn.start', sessionId: SESSION, turn: 1 });
+    // 证据在文本顺序上更早（order 更小），但假设分数更高、先被发布。
+    // 于是证据无法把假设当父节点（order 必须更早），却仍应与它连 supports。
+    await extractor.handle({
+        type: 'assistant.reasoning',
+        sessionId: SESSION,
+        turn: 1,
+        text: [
+            '证据：缓存键缺少用户维度导致同一 prompt 串数据。',
+            '',
+            '假设：缓存键缺少用户维度，因为同一 prompt 会串数据。',
+        ].join('\n'),
+    });
+    const nodes = [...store.state.nodes.values()];
+    const step = nodes.find((node) => node.kind === 'step');
+    const hypothesis = nodes.find((node) => node.kind === 'hypothesis');
+    const evidence = nodes.find((node) => node.kind === 'evidence');
+    assert.ok(step && hypothesis && evidence);
+    assert.equal(evidence.parentId, step.id, '证据不应挂到文本顺序更晚的假设下');
+    assert.ok(
+        store.state.edges.some((edge) => edge.kind === 'supports'
+            && edge.from === evidence.id && edge.to === hypothesis.id),
+        '证据仍应按语义相似度连到假设，而不是只能靠父子关系',
+    );
+});
+
 
 test('低于 minThoughtScore 的推理片段不建节点', async (t) => {
     const { store, extractor } = setup(t);
@@ -260,6 +340,17 @@ test('一轮会话自动生成 goal → step → action → conclusion', async (
     assert.equal(session.goalId, goal.id);
     assert.equal(session.turn, 1);
     assert.equal(session.activeNodeId, step.id);
+});
+
+test('泛化结论标题不建节点：结论：Fine 只留在轮次摘要', async (t) => {
+    const { store, extractor } = setup(t);
+    await extractor.handle({ type: 'session.start', sessionId: SESSION });
+    await extractor.handle({ type: 'user.message', sessionId: SESSION, text: '检查提取器是否留下无意义结论' });
+    await extractor.handle({ type: 'turn.start', sessionId: SESSION, turn: 1 });
+    await extractor.handle({ type: 'assistant.message', sessionId: SESSION, turn: 1, text: '\n结论：Fine' });
+    await extractor.handle({ type: 'turn.end', sessionId: SESSION, turn: 1, text: '\n结论：Fine' });
+    const conclusions = [...store.state.nodes.values()].filter((node) => node.kind === 'conclusion');
+    assert.equal(conclusions.length, 0, '泛化结论不应成为永久节点');
 });
 
 test('默认聚合模式：一轮多个工具调用只留一个汇总节点', async (t) => {
@@ -569,7 +660,7 @@ test('ranked：一轮多段推理只留关键节点，分层配额与总上限�
     // 纯过程旁白：只计入「过程观察 ×N」，不建节点。
     await extractor.handle({
         type: 'assistant.reasoning', sessionId: SESSION, turn: 1,
-        text: 'Let me read the README first.\n\n我先看一下测试结构。\n\nNext I will run the unit tests.',
+        text: 'Let me read the README first and inspect the existing test coverage in detail.\n\n我先看一下测试结构，确认现有用例覆盖了哪些路径。\n\nNext I will run the unit tests and check which assertions actually fail.',
     });
 
     const nodes = [...store.state.nodes.values()];
@@ -755,7 +846,7 @@ test('ranked：有 topic 时想法自动挂到主干叶根，step 只作时间�
     const { store, extractor } = setup(t);
     const emit = (event) => extractor.handle({ sessionId: SESSION, ...event });
     await emit({ type: 'turn.start', turn: 1 });
-    await emit({ type: 'user.message', turn: 1, sourceKind: 'user', text: '把想法挂到主干' });
+    await emit({ type: 'user.message', turn: 1, sourceKind: 'user', text: '自动挂载到主干' });
     const session = store.state.sessions.get(SESSION);
     const topicOp = await store.apply({
         t: 'addNode',
@@ -817,6 +908,77 @@ test('autoSeedTopic：无 topic 时单轮想法达到阈值后自动建候选主
     const direct = nodes.filter((node) => node.parentId === step.id && !['action', 'artifact', 'step'].includes(node.kind));
     assert.equal(direct.length, 0, '本轮想法应迁到 topic/叶根，而不是留在 step 下');
     assert.ok(nodes.some((node) => node.parentId === topic.id), '至少一个叶根挂在 topic 下');
+});
+
+test('topic 意图漂移：旧主题有容量但与新请求无关时，另起主题而不是继续塞旧仓', async (t) => {
+    const { store, extractor } = setup(t);
+    const emit = (event) => extractor.handle({ sessionId: SESSION, ...event });
+    await emit({ type: 'turn.start', turn: 1 });
+    await emit({ type: 'user.message', turn: 1, sourceKind: 'user', text: '优化缓存命中率' });
+    const session = store.state.sessions.get(SESSION);
+    const topicOp = await store.apply({
+        t: 'addNode',
+        node: { kind: 'topic', parentId: session.goalId, title: '缓存命中率分析', digest: '历史主题' },
+    });
+    const oldTopicId = topicOp.node.id;
+    await emit({ type: 'turn.end', turn: 1 });
+
+    await emit({ type: 'turn.start', turn: 2 });
+    await emit({ type: 'user.message', turn: 2, sourceKind: 'user', text: '排查文件锁竞争' });
+    await emit({
+        type: 'assistant.reasoning',
+        turn: 2,
+        text: [
+            '假设：文件锁在瞬时 ENOENT 时被误删，导致双进程同时进入临界区。',
+            '',
+            '假设：锁等待应识别瞬时竞争而不是把锁当成陈旧文件。',
+        ].join('\n'),
+    });
+    await emit({ type: 'turn.end', turn: 2 });
+
+    const topics = [...store.state.nodes.values()].filter((node) => node.kind === 'topic');
+    assert.equal(topics.length, 2, '新请求应另起一个候选主题');
+    assert.equal([...store.state.nodes.values()].filter((node) => node.parentId === oldTopicId).length, 0,
+        '无关的新想法不应塞进旧主题');
+    const fresh = topics.find((node) => node.id !== oldTopicId);
+    assert.match(fresh.title, /排查文件锁竞争/u);
+    assert.ok([...store.state.nodes.values()].some((node) => node.parentId === fresh.id), '新想法应挂到新主题下');
+});
+
+test('topic 意图：长用户消息用首句匹配主题，不被整段长度稀释（回归）', async (t) => {
+    const { store, extractor } = setup(t);
+    const emit = (event) => extractor.handle({ sessionId: SESSION, ...event });
+    await emit({ type: 'turn.start', turn: 1 });
+    const longMessage = [
+        '优化提取器，现在有很大的优化空间（提取内容不够准确和必要，关系也不太对）。',
+        '另外希望主题不要继续膨胀，父子关系只在语义确实相关时才建立，',
+        '轮末结论也不要被过程旁白淹没，必要时宁可少建节点。',
+        '最后请补一组回归测试，覆盖长消息、跨事件和同轮关系。',
+    ].join('');
+    await emit({ type: 'user.message', turn: 1, sourceKind: 'user', text: longMessage });
+    const session = store.state.sessions.get(SESSION);
+    const topicOp = await store.apply({
+        t: 'addNode',
+        node: { kind: 'topic', parentId: session.goalId, title: '建树算法与提取器', digest: '历史主题' },
+    });
+    const topicId = topicOp.node.id;
+    await emit({
+        type: 'assistant.reasoning',
+        turn: 1,
+        text: [
+            '假设：提取器把计划句当成假设，是因为缺少句式质量门。',
+            '',
+            '假设：主题膨胀是因为每轮都另起主题，而不是复用相关主题。',
+        ].join('\n'),
+    });
+    await emit({ type: 'turn.end', turn: 1 });
+
+    const topics = [...store.state.nodes.values()].filter((node) => node.kind === 'topic');
+    assert.equal(topics.length, 1, '长消息不应仅因长度另起主题');
+    assert.ok(
+        [...store.state.nodes.values()].some((node) => node.parentId === topicId),
+        '新想法应挂到首句匹配到的旧主题下',
+    );
 });
 
 test('ranked：跨轮 adopted 的历史节点落选后只解除映射，绝不删除（回归）', async (t) => {

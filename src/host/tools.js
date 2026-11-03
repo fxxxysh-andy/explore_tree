@@ -18,6 +18,7 @@ import {
     renderTree,
 } from '../core/compact.js';
 import { computeFrontier } from '../core/frontier.js';
+import { computeTeamBoard, computeWalk, renderTeamBoard, renderWalk } from '../core/navigate.js';
 import { childrenOf, ensureRevision, graphStats, LeaseError, requireNode, StaleRevisionError } from '../core/graph.js';
 import {
     digestBasisOf,
@@ -33,7 +34,7 @@ import {
     trunkStats,
 } from '../core/trunk.js';
 
-const READ_ACTIONS = ['overview', 'stats', 'frontier', 'find', 'node', 'path', 'tree', 'subtree', 'trunk', 'brief'];
+const READ_ACTIONS = ['overview', 'stats', 'frontier', 'walk', 'team', 'find', 'node', 'path', 'tree', 'subtree', 'trunk', 'brief'];
 const RECORD_ACTIONS = ['add', 'update', 'link', 'close', 'reopen', 'merge', 'move', 'promote', 'assign', 'handoff', 'digest', 'archive', 'rollback'];
 
 const commonTextOutput = {
@@ -144,14 +145,15 @@ function pickList(value) {
 export function buildToolDefinitions(service) {
     const readTool = {
         name: 'explore_tree',
-        description: '读取当前工作区的研究轨迹树（只读，返回缩略视图而不是整棵树）。action: overview=目标/焦点/未决/死路/最近/建议; trunk=摘要主干（goal→topic→叶根，含 digest，交流/交接用）; brief=≤400 字研究简报（轮首/压缩后读）; frontier=下一步建议与应避免方向; stats=统计（含 per-actor 创建/更新分布）; find=按关键词找节点; node=节点详情; path=到根路径; tree=从根/指定节点的缩略子树（受 depth 限制）; subtree=以某节点为根的子树（需 id）。开始新方向前先 overview；接续长期研究先 trunk/brief，避免重复造轮子。',
+        description: '读取当前工作区的研究轨迹树（只读，返回缩略视图而不是整棵树）。action: overview=目标/焦点/未决/死路/最近/建议; walk=沿当前分支展开（路径/子节点/未决叶/缺口/下一步与 add 模板）; team=与 Agent Teams 协作（读取真实成员/任务；我的主题/待认领/租约过期/冲突；任务用 description 的 [explore-tree:n12] 标记挂回节点）; trunk=摘要主干（goal→topic→叶根，含 digest，交流/交接用）; brief=≤400 字研究简报（轮首/压缩后读）; frontier=全局下一步建议与应避免方向; stats=统计（含 per-actor 创建/更新分布）; find=按关键词找节点; node=节点详情; path=到根路径; tree=从根/指定节点的缩略子树（受 depth 限制）; subtree=以某节点为根的子树（需 id）。沿树推进用 walk（焦点用 id/focus，省略则用会话游标）；多 agent 认领/交接前先 team。开始新方向前先 overview；接续长期研究先 trunk/brief，避免重复造轮子。',
         parameters: {
             type: 'object',
             properties: {
                 action: { type: 'string', enum: READ_ACTIONS, description: '要执行的查询；省略=overview。' },
                 query: { type: 'string', description: 'find 的关键词（标题/摘要/标签/引用里匹配）。' },
-                id: { type: 'string', description: 'node/path 的节点 id，如 n12。' },
-                focus: { type: 'string', description: '可选：指定焦点节点 id，影响 overview/frontier 的「最近/建议」。' },
+                id: { type: 'string', description: 'node/path/subtree/walk 的节点 id，如 n12。' },
+                focus: { type: 'string', description: '可选：指定焦点节点 id，影响 overview/frontier/walk 的「最近/建议」。' },
+                actor: { type: 'string', description: 'team：按 actor 过滤「我的主题」；省略时用当前会话 id。' },
                 limit: { type: 'number', description: '可选：建议/结果条数上限（1-20）。' },
                 depth: { type: 'number', description: '可选：tree/subtree 的层数（1-8，默认 3；读缩略树用 2）。' },
                 archived: { type: 'boolean', description: '可选：trunk 时包含已归档叶根（默认隐藏）。' },
@@ -170,6 +172,33 @@ export function buildToolDefinitions(service) {
                 const limit = Number.isInteger(args.limit) ? Math.min(20, Math.max(1, args.limit)) : undefined;
                 const focusId = resolveFocusId(state, args.focus, sessionId);
                 switch (action) {
+                    case 'walk': {
+                        if (typeof args.id === 'string' && !state.nodes.has(args.id)) {
+                            return { ok: false, action, text: `节点 ${args.id} 不存在。` };
+                        }
+                        if (typeof args.id !== 'string' && typeof args.focus === 'string' && !state.nodes.has(args.focus)) {
+                            return { ok: false, action, text: `焦点节点 ${args.focus} 不存在。` };
+                        }
+                        const requested = typeof args.id === 'string'
+                            ? args.id
+                            : (typeof args.focus === 'string' ? args.focus : focusId);
+                        const result = computeWalk(state, {
+                            sessionId,
+                            focusId: requested,
+                            limit: limit ?? 6,
+                            maxWidth: service.config?.maxOpenLeavesPerTopic,
+                        });
+                        return { ok: true, action, text: renderWalk(result) };
+                    }
+                    case 'team': {
+                        const board = computeTeamBoard(state, {
+                            actor: explicitActorOf(args) ?? sessionIdOf(exec),
+                            limit: limit ?? 8,
+                            maxWidth: service.config?.maxOpenLeavesPerTopic,
+                            team: await service.teamContext(exec),
+                        });
+                        return { ok: true, action, text: renderTeamBoard(board) };
+                    }
                     case 'stats':
                         return { ok: true, action, text: renderStats(state) };
                     case 'frontier': {

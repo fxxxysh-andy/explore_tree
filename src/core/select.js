@@ -54,10 +54,44 @@ const STRONG_CLAIM_PATTERN = /(?:结论|综上|因此|所以|失败|报错|不�
 /** 具体性：数字、百分比、路径、版本、测试名、对比结果。 */
 const SPECIFICITY_PATTERN = /[A-Za-z]:[\\/]|\/[\w.-]+\/|\b\d+(?:\.\d+)?%|\b\d{2,}(?:\.\d+)?\b|\.(?:js|ts|json|md|mjs|yaml|yml)\b|\b\d+\s*\/\s*\d+\b/iu;
 
+/** 计划/行动句：描述「下一步做什么」，不是研究命题。 */
+const PLAN_ACTION_VERBS = 'add|update|fix|remove|delete|create|write|read|run|check|test|verify|inspect|implement|refactor|rename|move|change|bump|commit|push|release|link|dedupe|filter|document|prepare|clean|rewrite|replace|drop|keep|use|try|make|do|reproduce|analyze|compare|merge|split|migrate|seed|reset|stop|start|review|confirm|ensure|consider|delegate|synthesize|mark|label|tag|trace|walk|open|close|save|load|parse|render';
+
+const PLAN_LEAD_PATTERN = new RegExp(
+    `^(?:(?:need|we need|i need|must|should|plan|todo|next(?: step)?|remaining|action|first)\\b[^.!?]{0,40}?\\b(?:${PLAN_ACTION_VERBS})\\b)`,
+    'iu',
+);
+// 连接词后只有紧跟动词才像「And then fix…」；「But the test output…」里的
+// test 是名词，不能因为 40 字内出现动词就折叠成计划句。
+const PLAN_CONJUNCTION_PATTERN = new RegExp(
+    `^(?:and|but|so|however|also|then)(?:\\s+then)?\\s+(?:${PLAN_ACTION_VERBS})\\b`,
+    'iu',
+);
+// 句首动词只有在后接宾语限定词/介词时才更像祈使句；「Test output shows…」
+// 「Read throughput dropped…」是名词主语，不能因为首词是动词就当计划句折叠。
+const ACTION_OBJECT_PATTERN = /(?:the|a|an|this|that|these|those|my|our|your|its|their|it|them|all|both|each|every|some|any|no|at|for|into|through|over|across|around|up|down|on|in|to)\b/iu;
+const PLAN_ACTION_LEAD_PATTERN = new RegExp(`^(?:${PLAN_ACTION_VERBS})\\b\\s*(?:${ACTION_OBJECT_PATTERN.source})`, 'iu');
+/** 只带指代/元信息的片段，缺少可独立阅读的命题。 */
+const META_FRAGMENT_PATTERN = /^(?:that'?s|this is|it is|was it|what about|how about|here'?s|there'?s)\b/iu;
+/** 无语义的泛化标题/句子。 */
+const GENERIC_CLAIM_PATTERN = /^(?:fine|good|ok(?:ay)?|yes|no|plan|done|next|interesting|right|sure|true|false|noted|agreed|maybe|perhaps|likely yes|probably yes)\s*[.!?]*$/iu;
+// 只折叠「Likely yes.」这类纯确认；「Likely yes, the cache is cold…」带有解释，仍是命题。
+const HEDGE_CONFIRMATION_PATTERN = /^(?:likely|probably|maybe|perhaps)?\s*yes\s*[.!?]*$/iu;
+/** 行动指令（Look/Check/Read/Add...）不是疑问句。 */
+const ACTION_INSTRUCTION_PATTERN = new RegExp(`^(?:${PLAN_ACTION_VERBS}|call|set|get|find|search|grep|show|print|list|apply|install|start|stop|commit|push|release)\\b`, 'iu');
+/** 显式取舍/决策信号；need/should/plan 单独不算决策。 */
+const EXPLICIT_DECISION_PATTERN = /(?:决定|选择|采用|改为|取舍|决策|方案|策略|回退|备选|放弃(?:这个|该|方案)|保留(?:这个|该|方案)|换成|改用|优先|instead of|rather than|trade-?off|chose|choose|chosen|decided|decision|will use|switch(?:ed)? to|revert(?:ed)? to|no longer|drop .+ (?:for|in favor of)|^(?:no|not|never|don't|do not|avoid|skip)\b)/iu;
+/** 观察/实测信号：证据不能只是 Given/Because 开头的推理前提。 */
+const OBSERVATION_SIGNAL_PATTERN = /(?:数据|实测|测试结果|观察到|观察|输出|日志|统计|对比|复现|跑了|执行结果|测试通过|测试失败|报错|错误|结果|显示|表明|说明|验证|测得|因为|由于|导致)|\b(?:measured|observed|test(?:ed|s)?|result(?:s)?|output|log(?:s)?|benchmark|reproduced|verified|shows?|indicates?|demonstrates?)\b|\d+(?:\.\d+)?\s*(?:%|ms|s|个|条|次|nodes?|files?|bytes?)/iu;
+/** 假设需要机制/条件/因果，而不只是 maybe/likely 的模糊语气。 */
+const HYPOTHESIS_MECHANISM_PATTERN = /(?:因为|由于|导致|所以|因此|说明|表明|意味着|取决于|如果|当|假设|推测|机制|解释|应该|应当|应能)|\b(?:because|since|therefore|thus|if|when|leads? to|causes?|explains?|mechanism|would|should|could|may|might|likely)\b/iu;
+const HYPOTHESIS_PLAN_LEAD_PATTERN = /^(?:need|we need|i need|let's|let us|plan|todo|next|remaining|action)\b/iu;
+const EVIDENCE_PREMISE_PATTERN = /^(?:given|since|assuming|suppose|supposing)\b/iu;
+
 const PROPOSITION_PATTERN = /[。！？!?]|(?:是|为|有|会|能|要|应|需|表明|说明|导致|意味着|取决于)|(?:is|are|has|have|will|can|should|means|because|which)/iu;
 
 /** 标题里要去掉的口头/过程前缀。 */
-const TITLE_LEAD_PATTERN = /^(?:(?:hmm+|ok(?:ay)?|actually|well|so|now|then|thus|therefore|wait|let me|let's|i'?ll|i will|i need to)\b[,，:：\s-]*)+/iu;
+const TITLE_LEAD_PATTERN = /^(?:(?:hmm+|ok(?:ay)?|actually|well|and|but|also|however|given|suppose|supposing|perhaps|maybe|likely|so|now|then|thus|therefore|wait|let me|let's|i'?ll|i will|i need to)\b[,，:：\s-]*)+/iu;
 const TITLE_LEAD_CJK_PATTERN = /^(?:那么|好的|现在|接下来|让我|我先|我来|首先我)[,，:：\s-]*/u;
 /** 类型标签前缀（假设：/Evidence: …）。 */
 const KIND_LABEL_PATTERN = /^(?:假设|假定|推测|猜测|怀疑|猜想|证据|依据|观察|决定|选择|采用|结论|问题|关键问题|answer|hypothesis|evidence|decision|conclusion|question)\s*[:：]\s*/iu;
@@ -121,6 +155,63 @@ function looksLikeProposition(value) {
 }
 
 /**
+ * 分类后的质量门：关键词命中只决定候选 kind，是否值得落成永久节点还要看
+ * 语义是否自足。返回 null 表示通过，否则返回折叠原因。
+ *
+ * 这里刻意只做保守否决：宁可把模糊句折叠进轮摘要，也不生成永久 open 节点。
+ */
+function claimQualityGate(value, kind, title, labeled) {
+    const text = String(value ?? '').trim();
+    const titleValue = String(title ?? '').trim();
+    if (text === '' || titleValue === '') return 'empty';
+    if (GENERIC_CLAIM_PATTERN.test(titleValue) || GENERIC_CLAIM_PATTERN.test(text)) return 'generic';
+    if (HEDGE_CONFIRMATION_PATTERN.test(text)) return 'generic';
+
+    if (kind === 'question') {
+        if (!isQuestionText(text)) return 'not-question';
+        if (ACTION_INSTRUCTION_PATTERN.test(text)) return 'action-instruction';
+        if (/^(?:what|how) about\b/iu.test(text)) return 'vague-question';
+        if (titleValue.length < 6) return 'short';
+        return null;
+    }
+
+    // plan/action 句：即使含 maybe/should/need，也不是研究命题。
+    if (PLAN_ACTION_LEAD_PATTERN.test(text) || PLAN_LEAD_PATTERN.test(text)
+        || PLAN_CONJUNCTION_PATTERN.test(text)) return 'plan';
+    if (META_FRAGMENT_PATTERN.test(text) && !isQuestionText(text)) return 'meta-fragment';
+
+    if (kind === 'hypothesis') {
+        if (HYPOTHESIS_PLAN_LEAD_PATTERN.test(text)) return 'plan';
+        if (titleValue.length < 8) return 'short';
+        if (labeled) return null;
+        if (!HYPOTHESIS_MECHANISM_PATTERN.test(text)) return 'no-mechanism';
+        return null;
+    }
+
+    if (kind === 'decision') {
+        if (titleValue.length < 6) return 'short';
+        if (!EXPLICIT_DECISION_PATTERN.test(text)) return 'not-explicit';
+        return null;
+    }
+
+    if (kind === 'evidence') {
+        // Given/Since 开头是推理前提，不是观察；先于观察信号判断。
+        if (EVIDENCE_PREMISE_PATTERN.test(text)) return 'premise';
+        if (labeled) return null;
+        if (!OBSERVATION_SIGNAL_PATTERN.test(text) && !SPECIFICITY_PATTERN.test(text)) return 'not-observation';
+        return null;
+    }
+
+    if (kind === 'conclusion') {
+        if (titleValue.length < 8) return 'short';
+        if (/^(?:should|need|we need|let's|plan|todo|maybe|perhaps)\b/iu.test(text)
+            && !EXPLICIT_DECISION_PATTERN.test(text)) return 'plan';
+        return null;
+    }
+    return null;
+}
+
+/**
  * 多特征分类：返回 kind 与置信度；margin 太小或分数太低时归入 note（折叠候选）。
  *
  * @param {string} text
@@ -161,7 +252,7 @@ export function classifyClaim(text, options = {}) {
         question: 1.6 * features.question + 2.0 * features.questionMark + 0.25 * features.specificity + 0.2 * features.proposition,
         dead_end: 2.0 * features.failure + 0.4 * features.specificity + 0.2 * features.proposition,
         hypothesis: 2.2 * features.hypothesis + 0.5 * features.proposition + 0.25 * features.specificity,
-        evidence: 2.0 * features.evidence + 0.5 * features.specificity + 0.3 * features.proposition,
+        evidence: 2.2 * features.evidence + 0.5 * features.specificity + 0.3 * features.proposition,
         decision: 2.0 * features.decision + 0.4 * features.specificity + 0.2 * features.proposition,
         conclusion: 2.0 * features.conclusion + 0.5 * features.proposition + 0.2 * features.specificity,
         note: 0.7,
@@ -175,13 +266,44 @@ export function classifyClaim(text, options = {}) {
     const top = ranked[0];
     const second = ranked[1] ?? { score: 0 };
     const margin = top.score - second.score;
-    const kind = top.kind !== 'note' && top.score >= minScore && margin >= marginSetting ? top.kind : 'note';
+    let kind = top.kind !== 'note' && top.score >= minScore && margin >= marginSetting ? top.kind : 'note';
+    // 显式标签（「证据：」「假设：」）是作者意图；正文里顺带出现别的关键词时仍以标签为准。
+    if (kind !== 'note' && labeledKinds.size === 1) {
+        const labeledKind = [...labeledKinds][0];
+        if ((scores[labeledKind] ?? 0) >= minScore) kind = labeledKind;
+    }
+    if (kind === 'note') {
+        return {
+            kind,
+            score: Math.round(top.score * 100) / 100,
+            margin: Math.round(margin * 100) / 100,
+            title: '',
+            claim: triggerSentence(sentences, 'note', features),
+            features,
+            narration: false,
+        };
+    }
+    const trigger = triggerSentence(sentences, kind, features);
+    const title = cleanTitle(trigger, 120);
+    const gate = claimQualityGate(value, kind, title, labeledKinds.has(kind));
+    if (gate !== null) {
+        return {
+            kind: 'note',
+            score: Math.round(top.score * 100) / 100,
+            margin: Math.round(margin * 100) / 100,
+            title: '',
+            claim: trigger,
+            features: { ...features, qualityGate: 1 },
+            narration: false,
+            qualityGate: gate,
+        };
+    }
     return {
         kind,
         score: Math.round(top.score * 100) / 100,
         margin: Math.round(margin * 100) / 100,
-        title: kind === 'note' ? '' : cleanTitle(triggerSentence(sentences, kind, features), 120),
-        claim: triggerSentence(sentences, kind === 'note' ? 'note' : kind, features),
+        title,
+        claim: trigger,
         features,
         narration: false,
     };
@@ -235,12 +357,14 @@ function cleanTitle(text, max) {
         .replace(/[#>*_`~]/gu, ' ')
         .replace(/^\s*[-*•·]\s*/u, '')
         .replace(KIND_LABEL_PATTERN, '')
+        // 负号不是破折号：em/en dash 可接 if/then/so；ASCII 连字符必须是「- if/then/so」。
+        .replace(/^(?:[—–]\s*(?:if|then|so)?\s*|-\s+(?:if|then|so)\s*)/iu, '')
         .replace(TITLE_LEAD_PATTERN, '')
         .replace(TITLE_LEAD_CJK_PATTERN, '')
         .replace(/\s+/gu, ' ')
         .replace(/^[，,、;；:：.\s]+|[，,、;；:：。.!！?？\s]+$/gu, '')
         .trim();
-    // 只在确实是数学文本时清 LaTeX，避免把 Windows 路径的 \path 当成命令删掉。
+    // 只在确实是数学文本时清 LaTeX，避免把 Windows 路径的 \yky 当成命令删掉。
     if (isMath) {
         cleaned = cleaned.replace(/\\[a-zA-Z]+/gu, ' ').replace(/[{}$^]/gu, ' ').replace(/\s+/gu, ' ').trim();
     }
@@ -336,6 +460,7 @@ export function selectClaims(candidates, options = {}) {
             title: String(candidate.title ?? ''),
             order: Number.isFinite(candidate.order) ? candidate.order : 0,
             seen: Number.isFinite(candidate.seen) ? candidate.seen : 1,
+            block: Number.isFinite(candidate.block) ? candidate.block : 0,
         };
         if (item.kind === 'note' && noteNodeMode === 'fold') {
             folded.push(item);

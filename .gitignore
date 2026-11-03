@@ -5,7 +5,8 @@ node_modules/
 .tmp-*
 *.log
 .DS_Store
-.env
-.env.*
-*.key
-*_key.txt
+# 实验大输出可复现，不入库（命令见 docs/multi-agent-experiment.md 附录 A）
+experiments/cc-sim/out/
+research/data/results.json
+research/data/results-v1.3.json
+research/verify/data/canonical-30.json

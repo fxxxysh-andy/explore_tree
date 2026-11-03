@@ -101,6 +101,46 @@ test('classifyClaim：过程旁白折叠为 note，不占节点', () => {
     assert.equal(classifyClaim('我先确认一点：3/3 的 goal 都来自注入消息，所以来源过滤是首要修复。').narration, false);
 });
 
+test('claimQualityGate：计划句、泛化确认与推理前提折叠为 note，显式标签保留', () => {
+    for (const text of [
+        'Need likely do real analysis, reproduce issues, then implement',
+        'Package check includes maybe',
+        "That's 2 instead of 3",
+        'Fine',
+        'Given the cache is cold, the first read will be slow',
+        'Look at the existing test fixture before changing assertions',
+        'What about event.key === null',
+    ]) {
+        const claim = classifyClaim(text);
+        assert.equal(claim.kind, 'note', text);
+    }
+    // 显式标签是作者意图：没有机制词/观察词的假设与证据仍保留。
+    assert.equal(classifyClaim('假设：工具调用的聚合顺序会影响结果').kind, 'hypothesis');
+    assert.equal(classifyClaim('证据：工具调用的聚合顺序会影响结果').kind, 'evidence');
+});
+
+test('claimQualityGate：句首动词作名词主语时不被误判为计划句', () => {
+    // 「Test output…」「Check output…」是观察句，不是祈使句；首词恰好是动词列表里的词。
+    assert.equal(classifyClaim('Test output shows 4 failures in the lock test').kind, 'evidence');
+    assert.equal(classifyClaim('Check output confirms the lock was released').kind, 'evidence');
+    // 真正的祈使句仍然折叠。
+    assert.equal(classifyClaim('Look at the existing fixture before editing').kind, 'note');
+    assert.equal(classifyClaim('Add a regression test for the lock timeout').kind, 'note');
+});
+
+test('claimQualityGate：负号不被当作破折号，纯确认才折叠', () => {
+    const negative = classifyClaim('结论：-0.5% p95 回归说明新实现略慢');
+    assert.equal(negative.kind, 'conclusion');
+    assert.match(negative.title, /^-0\.5%/u, '负号应保留，不能洗成 0.5%');
+    assert.match(
+        classifyClaim('结论：- 0.5% p95 回归说明新实现略慢').title,
+        /^- 0\.5%/u,
+        '连字符后接数字时不是破折号',
+    );
+    assert.equal(classifyClaim('Likely yes.').kind, 'note');
+    assert.notEqual(classifyClaim('Likely yes, the cache is cold and the 42 tests pass').kind, 'note');
+});
+
 test('classifyClaim：标题取触发 kind 的句子，而不是第一句', () => {
     const claim = classifyClaim('这一句只是铺垫。假设：配额应该按层分配，而不是先到先得。');
     assert.equal(claim.kind, 'hypothesis');

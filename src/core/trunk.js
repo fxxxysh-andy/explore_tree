@@ -424,15 +424,35 @@ export function claimableTopics(state, now = Date.now()) {
         });
 }
 
-/** topic ↔ Team task 的映射负载（subject/description/标签；writeScopes 由调用方补文件范围）。 */
+/**
+ * Team 任务与树节点的关联标记。任务 description 里出现该标记时，
+ * explore_tree action=team 会把真实 Team 任务挂回对应节点。
+ */
+export const TEAM_TASK_MARKER_PREFIX = '[explore-tree:';
+
+/** @param {string} nodeId */
+export function teamTaskMarker(nodeId) {
+    return `${TEAM_TASK_MARKER_PREFIX}${nodeId}]`;
+}
+
+/** 从 Team 任务描述里解析关联节点 id；没有标记时返回 null。 */
+export function parseTeamTaskMarker(text) {
+    if (typeof text !== 'string') return null;
+    const match = /\[explore-tree:(n\d+)\]/iu.exec(text);
+    return match === null ? null : match[1];
+}
+
+/** topic ↔ Team task 的映射负载（subject/description/marker/tags；writeScopes 由调用方补文件范围）。 */
 export function topicTaskPayload(topic) {
     if (!isTopic(topic)) return null;
     const description = typeof topic.digest === 'string' && topic.digest !== ''
         ? topic.digest
         : (typeof topic.summary === 'string' ? topic.summary : '');
+    const marker = teamTaskMarker(topic.id);
     return {
         subject: topic.title,
-        description: description === '' ? topic.title : description,
+        description: `${marker}\n${description === '' ? topic.title : description}`,
+        marker,
         tags: ['explore-tree', 'topic', ...(topic.priority ? [topic.priority] : [])],
     };
 }

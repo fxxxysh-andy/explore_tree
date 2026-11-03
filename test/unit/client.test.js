@@ -35,6 +35,12 @@ function loadBundle(options = {}) {
             setItem(key, value) { options.localStorage.set(key, String(value)); },
         };
     }
+    if (options.windowEvents !== undefined) {
+        sandbox.window.addEventListener = (type, listener) => {
+            if (type === 'storage') options.windowEvents.push(listener);
+        };
+        sandbox.window.removeEventListener = () => {};
+    }
     vm.createContext(sandbox);
     vm.runInContext(source, sandbox, { filename: bundlePath });
     assert.equal(registered.length, 1, 'bundle 必须只调用一次 __ModuleLoader__.load');
@@ -76,19 +82,38 @@ describe('lib/client.js bundle contract', () => {
         assert.equal(typeof module.apply, 'function');
     });
 
-    it('注册 conversation.view 页签与 settings.section 设置分区', () => {
+    it('注册 conversation.view、settings.section 与右侧栏预览', () => {
         const registration = loadBundle();
         const module = registration.factory(() => reactStub());
         const injected = [];
+        const injectedDeps = [];
+        const tabs = [];
         const ctx = {
             slots: {
                 inject(name, factory) { injected.push({ name, entry: factory() }); },
                 register(options, component) { return { options, component }; },
             },
+            inject(_deps, callback) {
+                const deps = Array.from(_deps);
+                injectedDeps.push(deps);
+                if (deps.length === 1 && deps[0] === 'sidebarRight') {
+                    callback({ sidebarRight: { openTab() {} }, effect(execute) { execute(); return () => {}; } });
+                    return;
+                }
+                if (deps.length === 1 && deps[0] === 'sidebarRightTabs') {
+                    callback({
+                        sidebarRightTabs: { register(definition) { tabs.push(definition); return () => {}; } },
+                        effect(execute) { execute(); return () => {}; },
+                    });
+                    return;
+                }
+                assert.fail(`意外的可选注入依赖：${deps.join(',')}`);
+            },
         };
         module.apply(ctx);
-        assert.equal(injected.length, 2);
-        assert.deepEqual(injected.map((item) => item.name), ['conversation.view', 'settings.section']);
+        assert.deepEqual(injectedDeps, [['sidebarRight'], ['sidebarRightTabs']], '导航与页签分别可选注入，sidebarRight 缺失不应让 body 消失');
+        assert.equal(injected.length, 3);
+        assert.deepEqual(injected.map((item) => item.name), ['conversation.view', 'settings.section', 'sidebar.right.pane.tab']);
         const view = injected[0].entry;
         assert.equal(view.options.name, 'conversation.view');
         assert.equal(view.options.id, 'explore-tree');
@@ -103,6 +128,113 @@ describe('lib/client.js bundle contract', () => {
         assert.equal(typeof settings.options.label, 'function');
         assert.equal(settings.options.label(), '研究轨迹');
         assert.equal(typeof settings.component, 'function');
+
+        assert.equal(tabs.length, 1, '右侧栏只注册一个页签');
+        assert.equal(tabs[0].id, 'research-tree');
+        assert.equal(tabs[0].kind, 'research-tree');
+        assert.equal(tabs[0].keepMounted, true);
+        assert.equal(tabs[0].priority, 'extension');
+        assert.equal(typeof tabs[0].title, 'function');
+        assert.equal(tabs[0].title(), '研究轨迹');
+        assert.equal(tabs[0].guide[0].id, 'explore-tree');
+        // 侧边栏 GuideBody 直接调用 entry.title() 和 entry.description?.()；
+        // 字符串会让整页 guide 抛 TypeError，必须锁成函数。
+        assert.equal(typeof tabs[0].guide[0].title, 'function');
+        assert.equal(tabs[0].guide[0].title(), '研究轨迹');
+        assert.equal(typeof tabs[0].guide[0].description, 'function');
+        assert.match(tabs[0].guide[0].description(), /目标、未决与下一步/);
+        const preview = injected[2].entry;
+        assert.equal(preview.options.name, 'sidebar.right.pane.tab');
+        assert.equal(preview.options.key, 'research-tree');
+        assert.equal(typeof preview.component, 'function');
+    });
+
+    it('面板工具栏的「右侧栏」按钮调用 sidebarRight.openTab', () => {
+        const registration = loadBundle();
+        const module = registration.factory(() => reactStub());
+        let viewEntry;
+        const opened = [];
+        module.apply({
+            slots: {
+                inject(name, factory) {
+                    const entry = factory();
+                    if (name === 'conversation.view') viewEntry = entry;
+                },
+                register(options, component) { return { options, component }; },
+            },
+            inject(_deps, callback) {
+                const deps = Array.from(_deps);
+                if (deps.includes('sidebarRight')) {
+                    callback({ sidebarRight: { openTab(kind) { opened.push(kind); } }, effect(execute) { return execute(); } });
+                }
+                if (deps.includes('sidebarRightTabs')) {
+                    callback({ sidebarRightTabs: { register() { return () => {}; } }, effect(execute) { return execute(); } });
+                }
+            },
+        });
+        const tree = viewEntry.component({ sessionId: 's1', useSessions: undefined });
+        const button = findAll(tree, (node) => (
+            node.props && node.props.className === 'et-btn'
+            && Array.isArray(node.children) && node.children.includes('右侧栏')
+        ))[0];
+        assert.ok(button, '工具栏应有右侧栏入口，否则用户没有可见入口');
+        assert.equal(button.props.disabled, false);
+        button.props.onClick();
+        assert.deepEqual(opened, ['research-tree']);
+    });
+
+    it('页签类型 id 已被旧 bundle 占用时仍注册右侧栏 body，不留空白页签', () => {
+        const registration = loadBundle();
+        const module = registration.factory(() => reactStub());
+        let bodyEntry;
+        module.apply({
+            slots: {
+                inject(name, factory) {
+                    if (name === 'sidebar.right.pane.tab') bodyEntry = factory();
+                },
+                register(options, component) { return { options, component }; },
+            },
+            inject(_deps, callback) {
+                const deps = Array.from(_deps);
+                if (deps.includes('sidebarRight')) {
+                    callback({ sidebarRight: { openTab() {} }, effect(execute) { execute(); return () => {}; } });
+                }
+                if (deps.includes('sidebarRightTabs')) {
+                    callback({
+                        sidebarRightTabs: {
+                            register() { throw new Error('sidebarRight: tab type id "research-tree" is already registered'); },
+                        },
+                        effect(execute) { execute(); return () => {}; },
+                    });
+                }
+            },
+        });
+        assert.ok(bodyEntry, 'body 必须先于页签类型注册，否则重复 id 会让页签空白');
+        assert.equal(bodyEntry.options.key, 'research-tree');
+        assert.equal(typeof bodyEntry.component, 'function');
+    });
+
+    it('右侧栏预览在空数据下渲染加载态，不抛错', () => {
+        const registration = loadBundle();
+        const module = registration.factory(() => reactStub());
+        let previewEntry;
+        module.apply({
+            slots: {
+                inject(name, factory) { if (name === 'sidebar.right.pane.tab') previewEntry = factory(); },
+                register(options, component) { return { options, component }; },
+            },
+            inject(_deps, callback) {
+                callback({
+                    sidebarRightTabs: { register() { return () => {}; } },
+                    effect(execute) { return execute(); },
+                });
+            },
+        });
+        const tree = previewEntry.component({ sessionId: 's1', useSessions: undefined });
+        const json = JSON.stringify(tree);
+        assert.ok(json.includes('研究轨迹'), '预览标题必须出现');
+        assert.ok(json.includes('正在读取研究图'), '首帧显示加载态');
+        assert.ok(!json.includes('读取失败'), '未发起请求时不应显示错误态');
     });
 
     it('面板在空数据下渲染标题与加载态，不抛错', () => {
@@ -174,8 +306,47 @@ describe('lib/client.js bundle contract', () => {
         tree = settingsEntry.component({});
         assert.equal(toggle(tree, '自动刷新').props.checked, false, '关闭后重新渲染应反映新值');
         assert.equal(JSON.parse(storage.get('explore-tree.prefs.v1')).autoRefresh, false, '偏好应持久化');
+        assert.equal(storage.get('explore-tree.prefs.v1.autoRefresh'), 'false', '单项 key 是并发写入的真实来源');
         auto.props.onChange(true);
         assert.equal(JSON.parse(storage.get('explore-tree.prefs.v1')).autoRefresh, true);
+        assert.equal(storage.get('explore-tree.prefs.v1.autoRefresh'), 'true');
+    });
+
+    it('两个标签页改不同偏好不互相覆盖，storage 事件会同步', () => {
+        const storage = new Map();
+        const eventsA = [];
+        const eventsB = [];
+        const settingsOf = (registration) => {
+            const module = registration.factory(() => reactStub());
+            let entry;
+            module.apply({
+                slots: {
+                    inject(name, factory) {
+                        if (name === 'settings.section') entry = factory();
+                    },
+                    register(options, component) { return { options, component }; },
+                },
+            });
+            return entry.component;
+        };
+        const toggle = (tree, title) => findAll(tree, (node) => (
+            typeof node.type === 'function' && node.type.name === 'ToggleRow' && node.props.title === title
+        ))[0];
+        const settingsA = settingsOf(loadBundle({ localStorage: storage, windowEvents: eventsA }));
+        const settingsB = settingsOf(loadBundle({ localStorage: storage, windowEvents: eventsB }));
+
+        // A、B 都在对方写入前读到默认值，各自只改一个不同的偏好。
+        toggle(settingsA({}), '自动刷新').props.onChange(false);
+        toggle(settingsB({}), '隐藏笔记').props.onChange(false);
+
+        assert.equal(storage.get('explore-tree.prefs.v1.autoRefresh'), 'false', 'A 的自动刷新应保留');
+        assert.equal(storage.get('explore-tree.prefs.v1.hideNotes'), 'false', 'B 的隐藏笔记应保留');
+
+        // 任一标签页收到单项 key 的 storage 事件后重新合并，两个改动都在。
+        for (const listener of eventsA) listener({ key: 'explore-tree.prefs.v1.hideNotes' });
+        const treeA = settingsA({});
+        assert.equal(toggle(treeA, '自动刷新').props.checked, false);
+        assert.equal(toggle(treeA, '隐藏笔记').props.checked, false, 'A 应看到 B 的改动');
     });
 
     it('损坏的 localStorage 回退默认值', () => {

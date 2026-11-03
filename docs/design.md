@@ -40,7 +40,7 @@
 | 1 完整记录研究图 | `src/core/extract.js` 自动提取 + `journal.jsonl` 操作流水 + `explore_tree_record` 显式记录 |
 | 2 提供观察接口 | 工具 `explore_tree`（overview/frontier/stats/find/node/path/tree/subtree，缩略返回 + `depth`，`src/host/tools.js`） |
 | 3 树为核心 | `src/core/graph.js`：`Node.parentId` 单树，禁成环；`graph.edges` 存旁支关系 |
-| 4 DSH 内可视化 | `lib/client.js` 会话上栏页签（`conversation.view`）+ `GET /explore-tree/snapshot`（`src/host/service.js`） |
+| 4 DSH 内可视化 | `lib/client.js` 会话上栏页签（`conversation.view`）、右侧栏预览（`sidebar.right.pane.tab`）+ `GET /explore-tree/snapshot`（`src/host/service.js`） |
 | 5 自动产生、不干扰 | `ctx.on('session/event')` 旁路订阅 → `src/host/translate.js` → extractor；不写会话 |
 | 6 前缀不变 | `src/host/prompt.js` 静态段 + 固定工具面 + 动态状态只进工具返回；`test/unit/prefix.test.js` |
 | 7 引导探索 | `src/core/frontier.js` 混合建议 + `avoid`；静态协议提示（prompt.js） |
@@ -50,7 +50,7 @@
 
 ```
                        ┌──────────────────────────── 浏览器（DSH Web） ──────────────┐
-                       │ lib/client.js: conversation.view tab (cards+detail)    │
+                       │ lib/client.js: conversation.view + right sidebar       │
 23└───────────────▲─────────────────────────────────────────────────────────────┘
                                        │ GET /explore-tree/workspaces
                                        │ GET /explore-tree/snapshot?workspace=…
@@ -86,6 +86,7 @@
 | `src/core/extract.js` | 会话事件 → 研究图节点（确定性规则、预算、去重、中途接入兜底） |
 | `src/core/hygiene.js` | 未决卫生：open 节点分类/折叠计数/主题宽度平衡（只读纯函数，变更计划可审计） |
 | `src/core/frontier.js` | 探索建议引擎（verify/resolve/branch/deepen/consolidate/revive/stop + avoid） |
+| `src/core/navigate.js` | 沿树导航与 Agent Teams 协作：walk（路径/子节点/未决叶/缺口/下一步 add 模板）与 team（树侧租约/可认领/冲突 + 真实 Team 成员/任务） |
 | `src/core/compact.js` | 工具返回的紧凑文本渲染（控制在几百 token） |
 | `src/host/translate.js` | DSH `SessionEvent` → 内部归一化事件（纯函数，字段变化只改这里） |
 | `src/host/service.js` | 生命周期编排：每 store 一个 extractor、游标、HTTP 快照/列表、dispose |
@@ -93,7 +94,7 @@
 | `src/host/prompt.js` | 静态系统提示段（逐字节稳定） |
 | `src/host/config.js` | 配置归一化与默认值（不依赖 schemastery） |
 | `src/index.js` | 插件入口：注册工具/提示段/事件监听/HTTP 路由 |
-| `lib/client.js` | 浏览器 bundle（手写，无构建）：conversation.view 页签 |
+| `lib/client.js` | 浏览器 bundle（手写，无构建）：conversation.view 页签、settings.section 设置分区、sidebar.right.pane.tab 预览 |
 
 ## 4. 数据模型
 
@@ -149,9 +150,13 @@
 自动种子（v0.15）：goal 下没有任何 topic、且单轮想法 ≥ `topicSeedMinClaims` 时，提取器自动建一个
 `tags:[candidate,auto-topic]` 的 topic（标题取轮次意图），把本轮直接挂在 step 下的想法迁到该 topic，
 记 `activeTopicId`；已有 topic 但全部满仓/关闭时（v0.22.1），单条想法也可另起候选主题。
-后续轮次按 activeTopic 挂载，人工可改名/合并/promote。
-自动挂载（v0.14）：goal 下有 topic 时，提取器把 approach 直接挂到 `activeTopic` 下（成为叶根），
-dependent 挂同轮最近的 approach（否则 topic 下最近的叶根），并写 `stepId` 保留时间线。
+v0.24 起，主题还必须与当前用户意图相关（`topicIntentThreshold`，默认 0.12）；有容量但全部
+不相关时要求单轮至少 2 条想法才另起主题。后续轮次按相关且未满仓的 activeTopic 挂载，
+人工可改名/合并/promote。
+自动挂载（v0.14，v0.24 收紧）：goal 下有相关且未满仓的 topic 时，approach 直接挂到该 topic 下
+（成为叶根）；dependent 只有与 topic 下某个 approach 的词面相似度 ≥ `intraTurnLinkThreshold`
+（或与同段最后一条 approach 同段，中间可夹 note）时才挂到该节点，否则直接挂 topic 本身，不再猜「同轮最近 approach」，
+并写 `stepId` 保留时间线。
 
 ### 4.2 Edge（旁支关系）
 
@@ -167,7 +172,7 @@ dependent 挂同轮最近的 approach（否则 topic 下最近的叶根），并
 ```jsonc
 {
   "version": 1,
-  "workspaceRoot": "<workspace>",
+  "workspaceRoot": "D:\\…",
   "createdAt": "…", "updatedAt": "…",
   "seq": 42,                       // 下一个节点号
   "nodes": { "n1": {…} },
@@ -224,7 +229,7 @@ topic 必须有 digest；叶根应挂在 topic 下；主干深度 ≤4、宽度 
 | 真实用户消息 | 只认 `source.kind === 'user'`（旧事件缺省兼容）；首句截断为标题；同会话重复请求按指纹合并 `hits++` | `goal` |
 | 注入消息 | 时间采样/审批策略/工具通知等只写 runtime 上下文，不建节点、不当标题 | 无 |
 | 一轮开始 | 建/复用本轮 `step`：优先正常指纹，其次中途接入的 midway step（升级指纹并 move 到目标下）；标题先占位，真实用户消息到达后回填「第 N 轮：意图」 | `step` |
-| 推理文本（主） | 先 `thoughtSource` 取头+尾（默认 ≤60000 字符），`splitThoughts` 切分（去代码块、bullet 独立、续行/公式碎片并回上一段、12–400 字符）→ **句级 claim 切分**（`#claimSegments`：一句一 claim，短句并回上句，一段最多 4 条）→ `classifyClaim` 多特征矩阵（question/failure/hypothesis/evidence/decision/conclusion + 具体性/命题性，argmax + margin 阈值；过程旁白折叠）→ 候选池 → `selectClaims`（轮内近似去重、MMR 去冗余、分层配额、结论预留槽、`maxThoughtNodesPerTurn` 总上限）→ 对账落节点。`selectionStrategy=chronological` 可回退旧「先到先得」逻辑（配 `minThoughtScore`） | `question` / `hypothesis` / `evidence` / `dead_end` / `decision` / `conclusion`（`note` 默认折叠） |
+| 推理文本（主） | 先 `thoughtSource` 取头+尾（默认 ≤60000 字符），`splitThoughts` 切分（去代码块、bullet 独立、续行/公式碎片并回上一段、12–400 字符）→ **句级 claim 切分**（`#claimSegments`：一句一 claim，短句并回上句，一段最多 4 条）→ `classifyClaim` 多特征矩阵（question/failure/hypothesis/evidence/decision/conclusion + 具体性/命题性，argmax + margin 阈值；过程旁白折叠）→ `claimQualityGate` 按 kind 复核（question 真疑问句、hypothesis 有机制信号、decision 有明确取舍、evidence 非前提、conclusion 非泛化；被拒降 note）→ 候选池 → `selectClaims`（轮内近似去重、MMR 去冗余、分层配额、结论预留槽、`maxThoughtNodesPerTurn` 总上限）→ 对账落节点，再连同轮 typed edge。`selectionStrategy=chronological` 可回退旧「先到先得」逻辑（配 `minThoughtScore`；不经过质量门与同轮 typed edge） | `question` / `hypothesis` / `evidence` / `dead_end` / `decision` / `conclusion`（`note` 默认折叠） |
 | 英文/数学推理 | 规则同时覆盖中英文线索（`because/case/hypothesis/therefore` 等）与 LaTeX 公式；不按语言扣分；英文句号按「句号+空白」切分，避免切开 `v0.4.0`/`docs/x.md` | 同上 |
 | 推理文本（摘要） | 前 `maxReasoningChars` 字符截断追加到本轮 step.summary | `step.summary` |
 | 工具调用 | **默认每轮一个汇总节点**：轮内标题固定「工具调用（本轮）」，轮末一次性定稿「工具调用 ×N（read、grep…）」+ 各工具次数；`toolCallMode=nodes` 可切回逐调用节点 | `action` |
@@ -237,16 +242,18 @@ topic 必须有 digest；叶根应挂在 topic 下；主干深度 ≤4、宽度 
 | 轮次中断/失败 | step 标 `abandoned`；未完成 action 标失败 | 状态更新 |
 | 插件中途接入 | 既无 goal 也无 step 时补「接入前」容器 step，避免动作散落成根；后续轮次开始会复用 | `step` |
 | 同轮重复 step（旧图） | 首次读取时 `merge-duplicate-steps` 迁移：按 session+turn 分组，保留正常指纹节点，其余子树/命中/引用并过去后删除 | 图修正 |
-| 跨轮延续 | 新 step 与同会话上一 step 建 `continues` 边；新 claim 与往轮节点按标题/整段相似度（max，≥`threadLinkThreshold`）建 `supports`/`refines`/`replaces`/`contradicts` 边，每节点取最佳一条（evidence→假设 supports；结论→假设 supports；decision→旧 decision replaces；dead_end→假设 contradicts；假设→假设/结论 refines） | `edges` |
-| 同轮子方法 | approach（question/hypothesis/decision）与同轮更早的 approach 相似度 ≥ 门槛时挂成它的子节点（子方法/子假设），否则挂 step | `parentId` |
+| 跨轮延续 | 新 step 与同会话上一 step 建 `continues` 边；新 claim 与往轮节点按标题/整段相似度（max，≥`threadLinkThreshold`）建 `supports`/`refines`/`replaces`/`contradicts` 边，每节点取最佳一条（evidence→假设 supports；结论→假设 supports；decision→旧 decision replaces；dead_end→假设 contradicts；假设→假设/结论 refines）；落边前用 `#edgeExists` 去重 | `edges` |
+| 同轮 typed edge | 新 claim 与同轮更早 claim 相似度 ≥ `intraTurnLinkThreshold` 时，按 kind 连一条最相关关系（evidence→hypothesis/question/decision supports，否定语气为 contradicts；conclusion→hypothesis supports、→decision/conclusion refines；dead_end→hypothesis contradicts；decision→decision replaces、→question/hypothesis refines；hypothesis→hypothesis/decision/conclusion refines、→question related）；父子关系分数按 1；每节点最多一条 | `edges` |
+| 同轮子方法 | approach（question/hypothesis/decision）与同轮更早的 approach 相似度 ≥ 门槛时挂成它的子节点（子方法/子假设），否则挂 step；依赖型 claim 仅在与更早节点相似度 ≥ 门槛或与同段最后一条 approach（中间可夹 note）同段时挂到它下面，否则挂 step/topic（v0.24 去掉「无条件最近 approach」回退） | `parentId` |
 | 轮次收束 | ranked 模式 turn 结束把 decision/hypothesis/question 写成「关键：」、conclusion/evidence/dead_end 写成「结果：」，追加进 step.summary（不覆盖已有人工摘要） | `step.summary` |
 | 重复指纹 | `hits++`，UI/工具里可见「重复劳动」信号 | 节点字段 |
 
 推理链是树的主要来源：先切「想法单元」，再切句、按多特征矩阵分信息类型，再按信息量取舍；对错都保留，
 节点只表达「这是什么信息」与「当前状态」，不做正确性判定。取舍阶段只回答「这一轮哪 ≤10 条值得上树」：
 过程旁白折叠进 step 摘要（`过程观察 ×N`），同层超额候选不落节点，近似重复只留一条，结论单独留槽。
-层级规则：假设/问题/决策作为「思路节点」挂在当前 step 下，后续证据/观察/结论优先挂到这条思路上，
-形成多层树；工具调用只作为动作/产物旁证。
+层级规则：假设/问题/决策作为「思路节点」挂在当前 step 下，后续证据/观察/结论只在**确实相关**
+（相似度达标）或与同段最后一条 approach 同段（中间可夹 note）时才挂到这条思路上，否则留在 step 或 topic 下；同轮/跨轮再补一条 typed edge。
+工具调用只作为动作/产物旁证。
 
 **不记录**：`ignoreTools` 里的工具（默认两个插件自身工具，防止反向污染）；每轮自动节点数
 上限 `maxAutoNodesPerTurn`（默认 80）与想法节点上限 `maxThoughtNodesPerTurn`（默认 10），
@@ -286,6 +293,22 @@ is there、did/do/does + 双词主语、should + 名词主语、中文中置疑�
 `frontier.deadEnds`、`overview` 的死路统计与轮首增量的「放弃」都排除 `auto-curated`，
 避免自动收敛项被误当死路。
 
+**v0.24 提取质量门与意图主题**：`claimQualityGate(value, kind, title, labeled)` 在分类矩阵之后
+做 kind 复核，返回 `empty/generic/not-question/action-instruction/vague-question/short/plan/
+meta-fragment/no-mechanism/not-explicit/premise/not-observation` 之一；被拒候选转 `note` 并带
+`features.qualityGate=1` 与原因，只进轮次摘要。显式单标签（「假设：」「证据：」等）在分数足够时
+强制按标签类型，并豁免机制词/观察词要求。结论侧另有 `GENERIC_CONCLUSION_TITLE` 拦截
+Fine/Plan/好的/完成 等泛化标题。
+
+主题侧新增 `topicIntentThreshold`（默认 0.12）：`#turnIntentText` 取最近真人消息的首句/首分句
+（否则取 step 标题去掉「第 N 轮：」），截断到 80 字，避免整段长消息稀释 Jaccard；
+`#topicIntentScore` 取主题标题/digest 与现有 open 叶根标题的最大相似度（只扫 topic 子节点）。
+`#pickTurnTopic` 只复用「open、未满仓、相关」的主题，按意图相关度降序、叶根数升序、更新时间降序
+排序；`activeTopic` 满仓/关闭/无关即清空。`#maybeSeedTopic` 在「有容量但均不相关」时要求
+`claimCount >= 2` 才另起主题；`claimCount === 0` 直接返回，避免只有 archived/closed topic 时建空主题。
+`selectClaims` 现在保留候选的 `block`；`block` 是轮级段号（`runtime.claimBlock`，轮首重置），
+跨 `assistant.reasoning` 事件延续，`#claimParentId` 的「同段紧邻」判断因此不会把不同事件误当相邻。
+
 ### 6.3 可选 LLM 辅助（v0.12，默认关闭）
 
 `config.llm.enabled=false`。开启且 `provider`/`model` 成对配置时，提取器在轮末把
@@ -311,9 +334,15 @@ is there、did/do/does + 双词主语、should + 名词主语、中文中置疑�
 - **交接**：`brief` 即会话内交接包（目标 + 主干 digest + 未决叶根 + 下一步），`trunk` 是主干地图。
   v0.20 增加显式 `handoff`：同一图操作内转移 `owner/leaseUntil/leaseEpoch`，并在 topic 下写
   `kind:conclusion, tags:['handoff']` 的交接包（digest + 未决叶根 + 最近关键节点）；该节点不算叶根。
-- **Team 映射**：核心函数 `topicTaskPayload(topic)` 产出 `{subject, description, tags}`，
-  可直接映射为 `team_task_create` 入参；`writeScopes` 由调用方补文件前缀。
-  topic 的 status 不自动回写任务板，避免双写漂移（由 agent 用 `updateNode`/Team 工具显式同步）。
+- **Team 映射（v0.26）**：核心函数 `topicTaskPayload(topic)` 产出
+  `{subject, description, marker, tags}`，可直接映射为 `team_task_create` 入参；
+  `description` 首行 `[explore-tree:n12]` 是节点标记，`team` 读取真实 Team 任务时据此挂回节点。
+  `writeScopes` 由调用方补文件前缀。topic 的 status 不自动回写任务板，避免双写漂移
+  （由 agent 用 `updateNode`/Team 工具显式同步）。
+- **Team 读取（v0.26）**：service 通过可选 `ctx.inject(['agentTeams'])` 注入 TeamService；
+  `teamContext(exec)` 用 `exec.agent` 调 `listMembers/listTasks`，失败或 Team 插件缺失时
+  返回 `available:false`。`computeTeamBoard` 不复制任务板，只合并真实成员/任务与树侧租约，
+  再为「没有同节点任务」的可认领主题输出 `taskSuggestions`（含 `team_task_create` 命令模板）。
 - **冲突**：用 `contradicts` 边表达互斥结论；两端最近 topic 相同时，`topicConflicts` 把它归到该 topic，
   `trunk` 标 `⚠冲突`、`brief` 列「冲突：…」、`trunkFrontier` 给 `resolve`、`handoff` 交接包也带上。
 - **P5（v0.19）**：
@@ -348,12 +377,47 @@ is there、did/do/does + 双词主语、should + 名词主语、中文中置疑�
     宽度隐藏只动自动完成项。
   - **v0.23.0**：面板显示/过滤开关移入 `settings.section` —— 新增「研究轨迹」设置分区，
     偏好统一存 `explore-tree.prefs.v1` 并由面板/设置页共享；工具栏只留画布操作。新增
-    `.github/workflows/release.yml`：推 `v*` tag 时在 windows-latest 跑语法检查、177 项单测、
+    `.github/workflows/release.yml`：推 `v*` tag 时在 windows-latest 跑语法检查、172 项单测（v0.23.0 当时）、
     `npm pack` 并创建 GitHub Release（附带 tarball）。
   - **v0.23.1**：v0.23.0 Release 失败修复——`snapshotFor` 先 canonical 化工作区路径，避免 Windows
     8.3/别名路径读到另一个 store；`graph.lock` 的 `stat` 瞬时 ENOENT 不再删除活锁，陈旧锁清理前
     二次核对 mtime/size，等待改为 5–15ms 随机退避并对竞争过的释放让出 0–3ms；release workflow
     增加 tag 与 package 版本一致性校验；设置页偏好监听 `storage` 跨标签页同步。
+  - **v0.23.2**：陈旧锁清理二次确认加入 token 比对（读-删窗口只能缩小）；取锁超时复位
+    `lockContended`；设置页偏好改为单项 localStorage key，两个标签页改不同项不再互相覆盖；
+    HTTP 快照少一次 canonical；修正 v0.23.0 历史测试计数。
+  - **v0.24.0**：提取器质量门（question 真疑问句、hypothesis 机制信号、decision 明确取舍、
+    evidence 非前提、conclusion 非泛化），不合格句子只进轮次摘要；去掉「无相似就挂最近
+    approach」回退，依赖节点只按相似度/同段最后一条 approach 挂载；新增同轮 typed edge 与
+    `#edgeExists` 去重；主题按 `topicIntentThreshold` 与用户消息首句做意图漂移检测；泛化结论
+    标题不建节点；`block` 改为轮级段号并跨事件延续，修复不同事件被误当相邻的错挂；
+    `topicIntentThreshold` 纳入 host 配置归一化。189 项单测。
+  - **v0.25.0**：新增只读 `explore_tree action=walk|team`，实现 `src/core/navigate.js`。
+    `walk` 以显式 id/focus → 会话 activeNodeId → goalId → 最新 goal → 根的顺序解析焦点，
+    返回路径/父级/兄弟/子节点/未决叶/缺口，并按「开放子节点优先」给 descend/expand/branch/
+    resume/stopped 与按 kind 的 `explore_tree_record add` 模板；leaf 焦点也会显示所在主题的
+    超宽缺口。`team` 按 actor 汇总 mine/others/unowned/expired/claimable/conflicts/staleDigests，
+    把 `topicTaskPayload` 的 subject/description/tags 作为任务草案（不自动建 Team 任务），
+    并给出 renew/claim/resolve/digest/split 命令模板。`frontier.js` 导出 hasEvidence/
+    hasContradiction 复用。199 项单测（新增 navigate.test.js 9 项 + host 工具集成 1 项）。
+  - **v0.26.0**：`team` 从独立任务板改为与 Agent Teams 协作：插件可选注入 `agentTeams`，
+    `teamContext(exec)` 用 `exec.agent` 读取真实成员/任务；任务 `description` 的
+    `[explore-tree:n12]` 标记解析为节点关联；无 Team 插件时降级为树侧租约，不伪造任务。
+    核心只输出 `taskSuggestions`，任务仍由 Team 插件创建，避免状态双写。新增右侧栏预览
+    （`sidebar.right.pane.tab`，tab id `research-tree`）：当前目标、节点/未决/关系计数、
+    未决前 3 项与第一条 next；通过可选 `ctx.inject(['sidebarRightTabs'])`
+    注册，缺少右栏插件时不影响主面板。201 项单测（host Team 读取 1 项 + client 右侧栏注册 1 项）。
+  - **v0.26.1**：右侧栏预览补显式入口：主面板工具栏「右侧栏」按钮调用
+    `sidebarRight.openTab('research-tree')`；首次进入某会话的研究轨迹页自动展开一次，
+    关掉后不再强制。可选注入扩为 `sidebarRightTabs + sidebarRight`，缺 `openTab` 仅禁用按钮。
+    202 项单测（client 9 项，新增按钮调用）。
+  - **v0.26.2**：右侧栏注册拆分：`sidebarRightTabs`（页签类型 + body）与
+    `sidebarRight`（导航）分别 `ctx.inject`；body 先注册，重复 tab id 只保留旧定义。
+    导航晚到通过 `sidebarPreviewPending` 补开一次。203 项单测（client 10 项，新增重复 id 仍有 body）。
+  - **v0.26.3**：修复右侧栏 guide 整页空白——`guide` 条目的 `title`/`description` 必须是
+    函数（宿主 `GuideBody` 直接调用），v0.26.0–v0.26.2 写成字符串会抛
+    `TypeError: entry.title is not a function`，并连带挡住 better-sidebar 的卡片；
+    client 用例锁住函数契约。
   - 未做：多 agent 对照实验（H4 协议已预注册）；自动提取仍不启用租约写域（只做归属，不阻断）。
 
 ### 6.5 归档与摘要版本（v0.17）
@@ -404,9 +468,18 @@ is there、did/do/does + 双词主语、should + 名词主语、中文中置疑�
 ## 9. 可视化（DSH Web 内：会话上栏页签）
 
 - `lib/client.js`：手写 `__ModuleLoader__.load` bundle，只依赖平台 seed 的 `react`。
-- 唯一槽位：`conversation.view` `{ id: 'explore-tree', order: 45, label: () => '研究轨迹' }`，
-  即会话上栏页签行里「轨迹」与「上下文」之间的「研究轨迹」。不再注册侧栏图标、`main`、
+- 槽位：`conversation.view` `{ id: 'explore-tree', order: 45, label: () => '研究轨迹' }`，
+  即会话上栏页签行里「轨迹」与「上下文」之间的「研究轨迹」；`settings.section` 设置分区；
+  `sidebar.right.pane.tab` 右侧栏预览 `{ key: 'research-tree' }`。不再注册侧栏图标、`main`、
   顶栏常驻按钮或 `shell.overlay` 弹层（用户反馈：顶栏按钮冗余且不解决图空白）。
+- 右侧栏预览（v0.26）：可选注入 `sidebarRightTabs`（页签类型 + body）与 `sidebarRight`（导航），注册 tab
+  `research-tree`（title「研究轨迹」、keepMounted、guide 条目）；body 用标准 props 的
+  `sessionId/useSessions` 绑定会话工作区，读 snapshot 显示目标、计数、未决前 3（details 展开摘要）
+  与第一条 frontier 建议，底部提示完整视图在会话页签。没有右侧栏插件时不注册。
+- 入口（v0.26.1）：tab 类型只贡献 guide 卡片，右栏收起时用户看不到；`ExploreTreePanel`
+  首次挂载时按 `sessionId` 自动 `openTab('research-tree')` 一次，工具栏「右侧栏」按钮
+  可随时重开（`disabled` 当宿主没有 `openTab`）。v0.26.2 把 body 注册提到类型注册之前，
+  导航服务后到时用 `sidebarPreviewPending` 补开，避免 HMR/旧 bundle 占 id 留下空白页签。
 - 面板（v0.10）：
   - 轮首简报注入（v0.22 增量）：`agent/pre-step` 追加一条 `source.kind=explore-tree-context` 的 user 消息
     （≤400 字：目标/主干 digest/其他主干/未决叶根/主干建议），同一轮最多一次，`compaction/end` 后强制补一次；
@@ -447,7 +520,7 @@ is there、did/do/does + 双词主语、should + 名词主语、中文中置疑�
 - 默认隐藏 `action` 节点（旧图里有几百个）；旧图 `note`（P0/P1 前的 process 旁白）也默认折叠，
   可在设置页取消「隐藏笔记」。可见子节点就近挂到未隐藏祖先，不破坏树形。
 - 首帧在数据到达前显示「正在读取研究图…」；画布对空数据防御，不因瞬时无快照而崩溃。
-  布局契约沿用客户端 API 调研 §5.3（页签不自建纵向滚动容器）。
+  布局契约沿用宿主右侧栏页签的滚动约定（页签不自建纵向滚动容器）。
 - 数据：`GET /explore-tree/workspaces` + `GET /explore-tree/snapshot?workspace=…`，
   打开时 3s 轮询；当前工作区优先会话 cwd（`props.sessionId` + `useSessions`），
   其次 `localStorage['explore-tree.workspace.<sessionId>']`，最后第一个已知工作区。
@@ -463,16 +536,17 @@ is there、did/do/does + 双词主语、should + 名词主语、中文中置疑�
 ### `explore_tree`（只读）
 
 ```
-action: overview|frontier|stats|find|node|path|tree|subtree   （省略=overview）
-query?（find 关键词）  id?（node/path/subtree 节点 id）  focus?（焦点节点 id）  limit?（1..20）
-depth?（tree/subtree 层数 1..8，默认 3）  —— 返回缩略树，不返回整棵树
+action: overview|frontier|walk|team|stats|find|node|path|tree|subtree   （省略=overview）
+query?（find 关键词）  id?（node/path/subtree/walk 节点 id）  focus?（焦点节点 id）  actor?（team）
+limit?（1..20）  depth?（tree/subtree 层数 1..8，默认 3）  —— 返回缩略导航/树，不返回整棵树
 ```
 
 返回 JSON（`{ok, action, text}`，`additionalProperties:true`），`output.render` 渲染成等宽文本。
 默认 `overview`：目标 + 焦点 + 两层大纲 + 活跃节点 + 前 3 条 frontier 建议 + 可用 action 提示，
 控制在 ~1500 token 内；**指定会话时只汇总该会话的节点**（树跨会话共享，避免把别的会话历史重贴一遍），
 目标标题截到 60 字。`find` 搜标题/摘要/标签/引用，标题命中优先，摘要命中附 80 字片段。
-`explore_tree` 自身调用不记图（再避免反馈环）。
+`explore_tree` 自身调用不记图（再避免反馈环）。`walk` 沿焦点子树给下一步与 add 模板；`team` 合并
+树侧租约（mine/others/unowned/expired/claimable/conflicts）与真实 Agent Teams 成员/任务，两者都只读且返回紧凑文本。
 
 ### `explore_tree_record`（显式记录）
 
@@ -514,6 +588,8 @@ children?（add 时一次建一层子节点，≤20）
       detectConclusions: true
       ignoreTools: [todo_write, get_goal, schedule_list]
       maxAutoNodesPerTurn: 80
+      maxOpenLeavesPerTopic: 9
+      topicIntentThreshold: 0.12
       selectionStrategy: ranked   # ranked | chronological
       maxThoughtNodesPerTurn: 10
       maxThoughtUnitsPerBlock: 8
@@ -545,25 +621,30 @@ children?（add 时一次建一层子节点，≤20）
 
 ## 12. 测试与验收
 
-- 单元（`npm test`，`node --test`）：100 项 / 9 个 suite
+- 单元（`npm test`，`node --test`）：203 项 / 13 个 suite
   - `model.test.js`：枚举归一化、截断、tags/refs。
   - `graph.test.js`：增删改、移动禁环、合并、校验、序列化往返。
   - `store.test.js`：落盘恢复、journal 重放 id 一致、损坏隔离、registry 共享、原子写。
   - `frontier.test.js`：建议混合、avoid、去重、过度自信标记。
   - `extract.test.js`：goal→step→action→artifact→conclusion、去重 hits、失败 dead_end、
     忽略自身工具、中断、中途接入容器、推理切分/分类/评分/标题（含英文/数学推理与公式续行）、
-    想法节点预算与去重、关键想法层级（证据挂假设下）、低信息量旁白不建节点、
-    工具调用聚合与 nodes 模式、重复轮次开始只建一个 step；P0：注入消息不建 goal、
-    turn/start 忽略注入文本、deliverable.presented 落 artifact 并去重；P1：ranked 轮次
-    候选池的分层配额/note 折叠/父子层级、chronological 回退。
+    想法节点预算与去重、关键想法层级、低信息量旁白不建节点、工具调用聚合与 nodes 模式、
+    重复轮次开始只建一个 step；P0：注入消息不建 goal、turn/start 忽略注入文本、
+    deliverable.presented 落 artifact 并去重；P1：ranked 轮次候选池的分层配额/note 折叠/
+    父子层级、chronological 回退；v0.24：无关证据不挂最近假设、跨事件证据不算同段紧邻、
+    同段紧邻证据挂假设并连 supports、typed edge 按语义选择目标、长用户消息用首句复用主题、
+    topic 意图漂移另起主题、泛化结论不建节点。
   - `select.test.js`：多特征分类矩阵（整句语义优先于单关键词）、过程旁白折叠、
-    标题取触发句（含句中标签）、Jaccard 近似去重、配额与结论预留槽、MMR 顺序、noteNodeMode。
+    标题取触发句（含句中标签）、Jaccard 近似去重、配额与结论预留槽、MMR 顺序、noteNodeMode；
+    v0.24：分类质量门（计划句/泛化确认/推理前提折叠为 note，显式标签保留）。
   - `host.test.js`：translate 全轮序列（sourceKind/step/工具名回填/产物白名单）、
     service 摄取/HTTP/非本机 403、全局工作区索引、历史会话回放补建（reasoning → 想法节点，幂等）、
-    工具读写、插件装配；P0：注入消息不建 goal 且真实消息回填轮次标题、midway step 被 turn/start
-    复用、同轮重复 step 快照期迁移合并、present 交付物落 artifact。
-  - `client.test.js`：bundle id/inject、双槽位注册（conversation.view + settings.section）、
-    首帧加载态。
+    工具读写、插件装配、配置归一化（`maxOpenLeavesPerTopic` 与 `topicIntentThreshold` 透传）；
+    P0：注入消息不建 goal 且真实消息回填轮次标题、midway step 被 turn/start 复用、
+    同轮重复 step 快照期迁移合并、present 交付物落 artifact。
+  - `client.test.js`：bundle id/inject、三槽位注册（conversation.view + settings.section +
+    sidebar.right.pane.tab）、首帧加载态、设置分区渲染、右侧栏预览空状态、工具栏「右侧栏」
+    按钮调用 `sidebarRight.openTab`、旧 tab id 被占用时仍注册 body（10 项）。
   - `prefix.test.js`：提示段静态、图变化前后工具面逐字节稳定、动态状态只走返回值。
 - E2E（`scripts/`，scratch profile 不碰主 profile）：
   `install.mjs --create` → `smoke.mjs --boot --path /explore-tree/health` 9/9 PASS
@@ -589,6 +670,8 @@ children?（add 时一次建一层子节点，≤20）
 - **未决膨胀**：v0.21 的四分类 + 折叠计数 + `planOpenCleanup` 标签化收敛；提取侧要求 question
   真的像疑问句、hypothesis 有推测信号，并给 topic 加 `maxOpenLeavesPerTopic` 宽度水位线。
   v0.22.1 收口了无 topic 图的误折叠、疑问句门控、blocker 保护与自动收敛项的死路语义。
+  v0.24 增加 kind 级质量门、主题意图漂移检测与同轮 typed edge，减少「泛化句变未决」和
+  「新请求堆旧主题」；词面相似度仍是启发式，换说法可能另起主题。
 - **Windows 路径/编码**：canonical path（realpath + 小写 key）；UTF-8 读写；原子写用
   「临时文件 + rename」。
 - **服务缺失**：webServer/workspaceRegistry/workingDirectory 按 optional 处理；缺失降级，

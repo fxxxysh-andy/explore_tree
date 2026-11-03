@@ -276,6 +276,49 @@ test('观察到陈旧锁但 rm 前已被新持有者重建时不得删除', asyn
     }
 });
 
+test('陈旧锁的 token 在二次确认时变化，不得删除（缩小 TOCTOU 窗口）', async (t) => {
+    const root = tempRoot(t);
+    const store = new WorkspaceGraphStore({ root, flushDelayMs: 60_000 });
+    await store.open();
+    const lockFile = path.join(root, '.explore-tree', 'graph.lock');
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: 1, token: 'stale-holder-A', at: new Date().toISOString() }), 'utf8');
+    const old = new Date(Date.now() - 30_000);
+    fs.utimesSync(lockFile, old, old);
+    const originalReadFile = fsp.readFile;
+    const originalRm = fsp.rm;
+    let reads = 0;
+    let rmCalls = 0;
+    fsp.readFile = async function patchedReadFile(file, ...rest) {
+        if (String(file) === lockFile) {
+            reads += 1;
+            // 两次快照读到不同 token（模拟清理者窗口内锁被替换），stat 的 mtime/size 不变。
+            const token = reads % 2 === 1 ? 'stale-holder-A' : 'stale-holder-B';
+            return JSON.stringify({ pid: 1, token, at: new Date().toISOString() });
+        }
+        return originalReadFile.call(this, file, ...rest);
+    };
+    fsp.rm = async function patchedRm(file, options) {
+        if (String(file) === lockFile) rmCalls += 1;
+        return originalRm.call(this, file, options);
+    };
+    try {
+        await assert.rejects(
+            store.apply({ t: 'addNode', node: { kind: 'goal', title: 'G' } }),
+            (error) => {
+                assert.match(error.message, /等待超时/);
+                return true;
+            },
+        );
+        assert.equal(rmCalls, 0, 'token 不一致时不得按旧的 mtime/size 删除锁');
+        assert.ok(reads > 1, '应确实做过二次 token 确认');
+    } finally {
+        fsp.readFile = originalReadFile;
+        fsp.rm = originalRm;
+        fs.rmSync(lockFile, { force: true });
+        await store.close();
+    }
+});
+
 test('open 抛瞬时 EPERM 时重试而不是让写进程失败', async (t) => {
     const root = tempRoot(t);
     const store = new WorkspaceGraphStore({ root, flushDelayMs: 60_000 });
@@ -327,6 +370,7 @@ test('持续 EPERM 超过 LOCK_WAIT_MS 抛出带最后错误码的超时错误',
         );
         assert.ok(attempts > 1, '应确实重复尝试过获取锁');
         assert.ok(attempts < 1000, `持续 EPERM 不应热循环（实际 ${attempts} 次）`);
+        assert.equal(store.lockContended, false, '超时后应复位竞争标记，避免下一次释放多睡');
     } finally {
         fsp.open = originalOpen;
         await store.close();

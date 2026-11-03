@@ -364,6 +364,9 @@ export class WorkspaceGraphStore extends EventEmitter {
             this.lockDepth += 1;
             return;
         }
+        // 上一次等待可能以超时结束（没有 release 机会），这里清掉竞争标记，
+        // 避免下一次正常释放时多睡 0–3ms。
+        this.lockContended = false;
         const started = Date.now();
         let lastError = null;
         let retryImmediately = false;
@@ -371,6 +374,7 @@ export class WorkspaceGraphStore extends EventEmitter {
             // 超时判定放在取锁之前，保证等待有上界；清理成功后的那一次重试不因刚好跨过
             // 截止时间而被误判（旧实现在 rm 成功后也会直接重试）。
             if (!retryImmediately && Date.now() - started > LOCK_WAIT_MS) {
+                this.lockContended = false;
                 throw lockTimeoutError(this.lockFile, lastError);
             }
             retryImmediately = false;
@@ -393,31 +397,22 @@ export class WorkspaceGraphStore extends EventEmitter {
                 if (!LOCK_CONTENTION_CODES.has(error.code)) throw error;
                 lastError = error;
                 this.lockContended = true;
-                let stat = null;
-                try {
-                    stat = await fsp.stat(this.lockFile);
-                } catch {
-                    stat = null;
-                }
-                if (stat === null) {
-                    // stat 的瞬间锁不存在（刚释放/删除挂起）。这里不能 rm：stat 与 rm 之间
+                const observed = await readLockSnapshot(this.lockFile);
+                if (observed === null) {
+                    // 快照的瞬间锁不存在（刚释放/删除挂起）。这里不能 rm：观察与 rm 之间
                     // 另一个进程可能已经创建了新锁，按旧判断 rm 会删掉活锁，让两个进程同时
                     // 进入临界区，进而产生重复 id、journal 覆盖和丢节点（v0.23.0 的 flaky）。
                     // 文件本来就不存在，没有需要清理的对象；稍等再试，也避免绕过等待上界。
                     await sleep(5);
                     continue;
                 }
-                if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
-                    // 删除前重新确认：从上面这个 stat 到 rm 之间，陈旧锁可能已被别的清理者
-                    // 删掉并由新持有者重建。只有仍是同一把陈旧锁（mtime/size 未变）才删。
-                    let stillStale = null;
-                    try {
-                        stillStale = await fsp.stat(this.lockFile);
-                    } catch {
-                        stillStale = null;
-                    }
-                    if (stillStale === null) continue;
-                    if (stillStale.mtimeMs !== stat.mtimeMs || stillStale.size !== stat.size) continue;
+                if (Date.now() - observed.mtimeMs > LOCK_STALE_MS) {
+                    // 删除前重新确认：从观察到 rm 之间，陈旧锁可能已被别的清理者删掉并由
+                    // 新持有者重建。只有 mtime/size/token 都没变（仍是同一把陈旧锁）才删；
+                    // token 比对能挡住「同尺寸、同 mtime 粒度」的替换，把窗口缩到读-删之间。
+                    const confirmed = await readLockSnapshot(this.lockFile);
+                    if (confirmed === null) continue;
+                    if (!sameLockSnapshot(observed, confirmed)) continue;
                     try {
                         await fsp.rm(this.lockFile, { force: true });
                         this.logger.warn('清理陈旧的 graph.lock（持有者可能已崩溃）。');
@@ -767,6 +762,30 @@ async function fileSize(file) {
         if (error.code === 'ENOENT') return 0;
         throw error;
     }
+}
+
+/** 锁文件快照：mtime/size + token；文件不存在为 null，内容暂不可读时 token 为 null。 */
+async function readLockSnapshot(file) {
+    let stat;
+    try {
+        stat = await fsp.stat(file);
+    } catch {
+        return null;
+    }
+    let token = null;
+    try {
+        const parsed = JSON.parse(await fsp.readFile(file, 'utf8'));
+        if (parsed !== null && typeof parsed === 'object' && typeof parsed.token === 'string') {
+            token = parsed.token;
+        }
+    } catch {
+        // 持有者刚 open 还没来得及写内容，或文件已损坏：token 未知，仍按 mtime/size 判断。
+    }
+    return { mtimeMs: stat.mtimeMs, size: stat.size, token };
+}
+
+function sameLockSnapshot(a, b) {
+    return a.mtimeMs === b.mtimeMs && a.size === b.size && a.token === b.token;
 }
 
 /** 文件戳（mtime+size）；不存在为 null。 */

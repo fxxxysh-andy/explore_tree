@@ -51,6 +51,8 @@ export const DEFAULT_EXTRACT_CONFIG = Object.freeze({
     topicSeedMinClaims: 5,
     /** 单个 topic 下最多保留的未决叶根；超出后新想法挂到其他主题/新主题，避免一棵巨仓。 */
     maxOpenLeavesPerTopic: 9,
+    /** 用户意图与 topic 的最低词面相似度；低于它视为新请求，不再塞进旧主题。 */
+    topicIntentThreshold: 0.12,
     captureToolCalls: true,
     /**
      * 工具调用的记录方式：
@@ -144,6 +146,8 @@ export const DEFAULT_EXTRACT_CONFIG = Object.freeze({
 });
 
 const CONCLUSION_PATTERN = /(^|\n)\s*(?:#{1,6}\s*)?(?:结论|小结|总结|综上|因此|所以|最终答案|答案[:：]|结论[:：])/;
+/** 这些词做结论标题不承载信息，宁可折叠进轮次摘要。 */
+const GENERIC_CONCLUSION_TITLE = /^(?:fine|good|ok(?:ay)?|yes|no|done|plan|next|interesting|maybe|perhaps|likely(?: yes)?|好的|可以|行|完成|计划|下一步|结论)$/iu;
 
 /** 想法节点的默认状态：不预判对错，只表达「还没定 / 已记下 / 已撞墙」。 */
 const THOUGHT_STATUS = Object.freeze({
@@ -176,7 +180,7 @@ export class ResearchExtractor {
         // P5.6：自动提取也要有可审计的 actor，否则 journal 里 96% 写事件无归属。
         this.actor = typeof options.actor === 'string' && options.actor.trim() !== '' ? options.actor.trim() : 'extractor';
 
-        /** @type {Map<string, {turn: number, startedTurn: number|null, stepId: string|null, lastUserText: string, lastInjectionText: string, pendingUserIntents: Array<{turn: number, text: string, messageId?: string}>, actionNodes: Map<string, string>, activeActionId: string|null, autoCount: number, claimNodes: Map<string, string>, claimCreatedNodes: Set<string>, warned: Set<string>}>} */
+        /** @type {Map<string, {turn: number, startedTurn: number|null, stepId: string|null, lastUserText: string, lastInjectionText: string, pendingUserIntents: Array<{turn: number, text: string, messageId?: string}>, actionNodes: Map<string, string>, activeActionId: string|null, autoCount: number, claimNodes: Map<string, string>, claimCreatedNodes: Set<string>, claimBlock: number, warned: Set<string>}>} */
         this.runtime = new Map();
         this.queue = Promise.resolve();
         this.disposed = false;
@@ -395,6 +399,7 @@ export class ResearchExtractor {
             runtime.claims = new Map();
             runtime.claimNodes = new Map();
             runtime.claimCreatedNodes = new Set();
+            runtime.claimBlock = 0;
             if (runtime.warned === undefined) runtime.warned = new Set();
             else runtime.warned.clear();
             runtime.claimSeq = 0;
@@ -542,12 +547,54 @@ export class ResearchExtractor {
             if (best === null || score > best.score) best = { other, kind, score };
         }
         if (best === null) return;
+        if (this.#edgeExists(node.id, best.other.id, best.kind)) return;
         await this.store.apply({
             t: 'link',
             from: node.id,
             to: best.other.id,
             kind: best.kind,
             note: `跨轮关联 ${Math.round(best.score * 100)}%（第 ${turn} 轮 → 第 ${best.other.turn} 轮）`,
+        });
+    }
+
+    #edgeExists(from, to, kind) {
+        return this.store.state.edges.some((edge) => edge.from === from
+            && edge.to === to
+            && (kind === undefined || edge.kind === kind));
+    }
+
+    /**
+     * 同轮 typed edge：新节点与同轮更早节点之间只连一条最相关的关系。
+     * 嵌套表达「谁在谁下面」，这里补的是语义关系（supports/contradicts/refines/replaces）；
+     * 与 parentId（已表达 supports 的结构关系）分开，避免图里只剩层级没有关系。
+     */
+    async #linkTurnEdges(sessionId, turn, node, runtime) {
+        if (node === undefined || !(runtime.claimNodes instanceof Map)) return;
+        const text = `${node.title} ${node.summary ?? ''}`;
+        let best = null;
+        for (const nodeId of runtime.claimNodes.values()) {
+            if (nodeId === node.id) continue;
+            const other = this.store.state.nodes.get(nodeId);
+            if (other === undefined || other.sessionId !== sessionId || other.turn !== turn) continue;
+            if (other.kind === 'goal' || other.kind === 'step' || other.kind === 'action'
+                || other.kind === 'artifact' || other.kind === 'note') continue;
+            const kind = this.#threadCandidateKind(node, other);
+            if (kind === null) continue;
+            if (this.#edgeExists(node.id, other.id, kind)) continue;
+            let score = similarity(text, `${other.title} ${other.summary ?? ''}`);
+            // 父子关系本身已经说明 evidence/conclusion 支撑哪个 approach，即使词面重合不多也连边。
+            if (node.parentId === other.id) score = Math.max(score, 1);
+            if (score < this.config.intraTurnLinkThreshold) continue;
+            if (best === null || score > best.score) best = { other, kind, score };
+        }
+        if (best === null) return;
+        if (this.#edgeExists(node.id, best.other.id, best.kind)) return;
+        await this.store.apply({
+            t: 'link',
+            from: node.id,
+            to: best.other.id,
+            kind: best.kind,
+            note: `同轮关联 ${Math.round(best.score * 100)}%（第 ${turn} 轮）`,
         });
     }
 
@@ -651,11 +698,11 @@ export class ResearchExtractor {
                 runtime.thoughtSkipped = (runtime.thoughtSkipped ?? 0) + 1;
                 continue;
             }
-        const approach = kind === 'hypothesis' || kind === 'question' || kind === 'decision';
-        let parentId = approach
-            ? step.id
-            : (runtime.thoughtParentId ?? step.id);
-        parentId = this.#topicAwareParent(kind, parentId, step.id, runtime, event.sessionId);
+            const approach = kind === 'hypothesis' || kind === 'question' || kind === 'decision';
+            let parentId = approach
+                ? step.id
+                : (runtime.thoughtParentId ?? step.id);
+            parentId = this.#topicAwareParent(kind, unit, parentId, step.id, runtime, event.sessionId);
             runtime.autoCount += 1;
             runtime.thoughtCount = (runtime.thoughtCount ?? 0) + 1;
             const node = await this.#addOrHit({
@@ -680,7 +727,12 @@ export class ResearchExtractor {
      */
     #collectClaims(event, runtime, units) {
         if (!(runtime.claims instanceof Map)) runtime.claims = new Map();
+        // block 是轮级段落号：跨 assistant.reasoning 事件不能重置，否则前一段的
+        // 假设会和后一段的证据被误判成「同段紧邻」。
+        if (!Number.isInteger(runtime.claimBlock)) runtime.claimBlock = 0;
         for (const unit of units) {
+            runtime.claimBlock += 1;
+            const block = runtime.claimBlock;
             for (const segment of this.#claimSegments(unit)) {
                 const claim = classifyClaim(segment, {
                     minChars: this.config.minThoughtChars,
@@ -732,6 +784,7 @@ export class ResearchExtractor {
                         score: claim.score,
                         title: claim.title,
                         order: runtime.claimSeq,
+                        block,
                         seen: 1,
                     });
                 } else {
@@ -812,7 +865,7 @@ export class ResearchExtractor {
         ];
         for (const item of ordered) {
             const rawParentId = this.#claimParentId(item, selected, step.id, runtime);
-            const parentId = this.#topicAwareParent(item.kind, rawParentId, step.id, runtime, event.sessionId);
+            const parentId = this.#topicAwareParent(item.kind, item.text, rawParentId, step.id, runtime, event.sessionId);
             const existingId = runtime.claimNodes.get(item.key);
             const cached = existingId === undefined ? undefined : this.store.state.nodes.get(existingId);
             const title = clampText(item.title || thoughtTitle(item.text, this.config.maxTitleChars), this.config.maxTitleChars);
@@ -860,6 +913,7 @@ export class ResearchExtractor {
             runtime.claimNodes.set(item.key, node.id);
             runtime.claimCreatedNodes.add(node.id);
             await this.#linkThreadEdges(event.sessionId, runtime.turn, node);
+            await this.#linkTurnEdges(event.sessionId, runtime.turn, node, runtime);
         }
         runtime.thoughtCount = runtime.claimNodes.size;
     }
@@ -867,7 +921,8 @@ export class ResearchExtractor {
     /**
      * 一个 claim 的父节点：
      * - approach：挂到「同轮更早、主题相近」的 approach 下（子假设/子方法），否则开新枝（step）；
-     * - dependent：优先挂到同轮更早的相关 claim（证据链/推理链），否则挂最近的 approach，再否则 step。
+     * - dependent：挂到同轮更早且相似度达标的 claim；没有相似候选时，只有同段紧邻的
+     *   前一条 approach 才作为父节点，否则留在 step（不再回退到「本轮最近的 approach」）。
      * 同轮嵌套用 intraTurnLinkThreshold（比跨轮的 threadLinkThreshold 宽松）。
      */
     #claimParentId(item, selected, stepId, runtime) {
@@ -895,13 +950,19 @@ export class ResearchExtractor {
         }
         if (best !== null) return best.node.id;
         if (isApproachKind(item.kind)) return stepId;
-        let latestApproach = null;
+        // 同一段推理里，依赖型 claim 跟随段落内最后一条 approach；中间夹着的
+        // note/旁白不打断（它们也会占用 order）。仍不回退到同轮其他段落或上一轮，
+        // 避免把无关证据挂到旧假设下面。
+        let fallback = null;
         for (const other of selected) {
-            if (!isApproachKind(other.kind) || other.order >= item.order) continue;
+            if (other.block !== item.block || other.order >= item.order) continue;
+            if (!isApproachKind(other.kind)) continue;
             const node = nodeOf(other);
-            if (node !== undefined) latestApproach = node.id;
+            if (node === undefined) continue;
+            if (fallback === null || other.order > fallback.order) fallback = { node, order: other.order };
         }
-        return latestApproach ?? stepId;
+        if (fallback !== null) return fallback.node.id;
+        return stepId;
     }
 
     #nodeDepth(node) {
@@ -919,13 +980,48 @@ export class ResearchExtractor {
 
     /** 主题下仍处于 open/active 的叶根数（容量用水位线，避免把新想法继续塞进巨仓）。 */
     #openLeafRootCount(topicId) {
-        return [...this.store.state.nodes.values()].filter((node) => node.parentId === topicId
-            && isLeafRootKind(node.kind)
+        return childrenOf(this.store.state, topicId).filter((node) => isLeafRootKind(node.kind)
             && (node.status === 'open' || node.status === 'active')
             && !(Array.isArray(node.tags) && node.tags.includes('archived'))).length;
     }
 
-    /** 本轮挂到哪个 topic：优先 activeTopicId；已关闭或叶根过多的主题不再接收新想法。 */
+    /**
+     * 本轮用户意图：优先用最近一条真人消息的首句/首分句，其次用 step 标题。
+     * 不能拿整条消息（可能几百字）和短 topic 标题做 Jaccard：分母被撑大，
+     * 明明相关的主题也会跌到阈值以下，导致每轮另起主题。
+     */
+    #turnIntentText(runtime) {
+        let raw = '';
+        if (typeof runtime.lastUserText === 'string' && runtime.lastUserText.trim() !== '') {
+            raw = runtime.lastUserText.trim();
+        } else {
+            const step = runtime.stepId !== null ? this.store.state.nodes.get(runtime.stepId) : undefined;
+            if (step !== undefined && typeof step.title === 'string') {
+                const title = step.title.replace(/^第\s*\d+\s*轮[：:]\s*/u, '').trim();
+                if (!isPlaceholderStepTitle(title)) raw = title;
+            }
+        }
+        if (raw === '') return '';
+        const firstSentence = splitSentences(raw)[0] ?? raw;
+        const firstClause = firstSentence.split(/[，,：:；;]/u)[0].trim();
+        const phrase = firstClause.length >= 4 ? firstClause : firstSentence;
+        return clampText(phrase, 80);
+    }
+
+    /** 用户意图与主题的关联度：主题标题/digest + 现有叶根标题，取最高词面相似度。 */
+    #topicIntentScore(topic, intentText) {
+        if (intentText === '') return 1;
+        let best = similarity(intentText, `${topic.title ?? ''} ${topic.digest ?? ''}`);
+        for (const node of childrenOf(this.store.state, topic.id)) {
+            if (!isLeafRootKind(node.kind)) continue;
+            if (node.status === 'done' || node.status === 'abandoned') continue;
+            if (Array.isArray(node.tags) && node.tags.includes('archived')) continue;
+            best = Math.max(best, similarity(intentText, node.title ?? ''));
+        }
+        return best;
+    }
+
+    /** 本轮挂到哪个 topic：先看用户意图是否相关，再看容量；都满足才复用。 */
     #pickTurnTopic(sessionId, runtime) {
         const state = this.store.state;
         const goalId = this.#goalId(sessionId);
@@ -933,56 +1029,67 @@ export class ResearchExtractor {
         const maxOpen = Number.isFinite(this.config.maxOpenLeavesPerTopic)
             ? Math.max(1, Math.floor(this.config.maxOpenLeavesPerTopic))
             : 9;
+        const threshold = Number.isFinite(this.config.topicIntentThreshold)
+            ? Math.max(0, Number(this.config.topicIntentThreshold))
+            : 0.12;
+        const intentText = this.#turnIntentText(runtime);
         const isOpenTopic = (node) => node !== undefined
             && node.kind === 'topic'
             && node.parentId === goalId
             && node.status !== 'done'
             && node.status !== 'abandoned'
             && !(Array.isArray(node.tags) && node.tags.includes('archived'));
+        const hasCapacity = (node) => this.#openLeafRootCount(node.id) < maxOpen;
+        const related = (node) => intentText === '' || this.#topicIntentScore(node, intentText) >= threshold;
         if (runtime.activeTopicId !== null) {
             const active = state.nodes.get(runtime.activeTopicId);
-            if (isOpenTopic(active) && this.#openLeafRootCount(active.id) < maxOpen) return active.id;
+            if (isOpenTopic(active) && hasCapacity(active) && related(active)) return active.id;
             runtime.activeTopicId = null;
         }
-        const topics = [...state.nodes.values()].filter(isOpenTopic);
-        if (topics.length === 0) return null;
-        // 优先选未决叶根少的主题，避免所有新想法继续堆在最近更新的巨仓里。
-        topics.sort((a, b) => this.#openLeafRootCount(a.id) - this.#openLeafRootCount(b.id)
-            || (a.updatedAt < b.updatedAt ? 1 : -1));
-        const chosen = topics[0];
-        if (this.#openLeafRootCount(chosen.id) >= maxOpen) return null;
+        // 容量与意图分数各算一次，避免在 sort 比较器里反复全量扫描并重复 tokenSet。
+        const scored = [];
+        for (const topic of state.nodes.values()) {
+            if (!isOpenTopic(topic)) continue;
+            const count = this.#openLeafRootCount(topic.id);
+            if (count >= maxOpen) continue;
+            const score = this.#topicIntentScore(topic, intentText);
+            if (intentText !== '' && score < threshold) continue;
+            scored.push({ topic, count, score });
+        }
+        if (scored.length === 0) return null;
+        scored.sort((a, b) => (intentText !== '' ? b.score - a.score : 0)
+            || a.count - b.count
+            || (a.topic.updatedAt < b.topic.updatedAt ? 1 : -1));
+        const chosen = scored[0].topic;
         runtime.activeTopicId = chosen.id;
         return chosen.id;
-    }
-
-    /** topic 下最近更新的、仍可承接细节的叶根（dependent claim 无处可挂时的兜底）。 */
-    #latestTopicLeafRoot(topicId) {
-        const leaves = [...this.store.state.nodes.values()]
-            .filter((node) => node.parentId === topicId
-                && isLeafRootKind(node.kind)
-                && node.status !== 'done'
-                && node.status !== 'abandoned'
-                && !(Array.isArray(node.tags) && node.tags.includes('archived')));
-        leaves.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
-        return leaves[0]?.id ?? null;
     }
 
     /**
      * 把「本应挂 step」的 claim 改挂到主干：
      * - approach / 结论 / 死路 → 直接作为 topic 的叶根；
-     * - evidence 等依赖型 → 同轮最近一个挂在 topic 下的 approach，否则 topic 下最近的叶根；
+     * - evidence 等依赖型 → 仅当与本轮挂在 topic 下的某个 approach 相似度达到
+     *   intraTurnLinkThreshold 时挂到它下面；没有相似叶根就挂 topic 本身，
+     *   不再猜「最近一个 approach」；
      * 找不到 topic/叶根时保持原父节点（旧图仍可运行）。
      */
-    #topicAwareParent(kind, parentId, stepId, runtime, sessionId) {
+    #topicAwareParent(kind, text, parentId, stepId, runtime, sessionId) {
         if (parentId !== stepId) return parentId;
         const topicId = this.#pickTurnTopic(sessionId, runtime);
         if (topicId === null) return parentId;
         if (isApproachKind(kind) || kind === 'conclusion' || kind === 'dead_end') return topicId;
-        for (const nodeId of [...runtime.claimNodes.values()].reverse()) {
+        // 依赖型想法只在确实相似时才挂到具体叶根；没有相似叶根就挂 topic 本身，
+        // 不猜测「最近一个 approach」，避免证据错挂到无关假设下。
+        let best = null;
+        for (const nodeId of runtime.claimNodes.values()) {
             const node = this.store.state.nodes.get(nodeId);
-            if (node !== undefined && node.parentId === topicId && isApproachKind(node.kind)) return node.id;
+            if (node === undefined || node.parentId !== topicId || !isApproachKind(node.kind)) continue;
+            const score = similarity(text, `${node.title} ${node.summary ?? ''}`);
+            if (score < this.config.intraTurnLinkThreshold) continue;
+            if (best === null || score > best.score) best = { id: node.id, score };
         }
-        return this.#latestTopicLeafRoot(topicId) ?? parentId;
+        if (best !== null) return best.id;
+        return topicId;
     }
 
     async #onAssistantMessage(event) {
@@ -1027,7 +1134,7 @@ export class ResearchExtractor {
             runtime.autoCount += 1;
             // 标题是主要阶段（挂 step 下、彼此并列）；加粗小标题是当前阶段的子论点。
             let parentId = section.level > 0 ? stepId : (majorId ?? stepId);
-            parentId = this.#topicAwareParent(kind, parentId, stepId, runtime, event.sessionId);
+            parentId = this.#topicAwareParent(kind, section.body, parentId, stepId, runtime, event.sessionId);
             const node = await this.#addOrHit({
                 parentId,
                 kind,
@@ -1396,21 +1503,35 @@ export class ResearchExtractor {
     async #maybeSeedTopic(event, runtime, step) {
         if (!this.config.autoSeedTopic || this.backfilling || step === null || step === undefined) return null;
         const claimCount = runtime.claimNodes instanceof Map ? runtime.claimNodes.size : 0;
+        if (claimCount === 0) return null;
         const goalId = this.#goalId(event.sessionId);
         if (goalId === null) return null;
         const state = this.store.state;
         const maxOpen = Number.isFinite(this.config.maxOpenLeavesPerTopic)
             ? Math.max(1, Math.floor(this.config.maxOpenLeavesPerTopic))
             : 9;
+        const threshold = Number.isFinite(this.config.topicIntentThreshold)
+            ? Math.max(0, Number(this.config.topicIntentThreshold))
+            : 0.12;
+        const intentText = this.#turnIntentText(runtime);
         const topics = [...state.nodes.values()].filter((node) => node.kind === 'topic' && node.parentId === goalId);
-        const hasCapacity = topics.some((topic) => topic.status !== 'done'
+        const isOpenTopic = (topic) => topic.status !== 'done'
             && topic.status !== 'abandoned'
-            && !(Array.isArray(topic.tags) && topic.tags.includes('archived'))
-            && this.#openLeafRootCount(topic.id) < maxOpen);
-        if (hasCapacity) return null;
+            && !(Array.isArray(topic.tags) && topic.tags.includes('archived'));
+        const related = (topic) => intentText === '' || this.#topicIntentScore(topic, intentText) >= threshold;
+        const relatedTopics = topics.filter((topic) => isOpenTopic(topic) && related(topic));
+        const hasRelatedCapacity = relatedTopics.some((topic) => this.#openLeafRootCount(topic.id) < maxOpen);
+        if (hasRelatedCapacity) return null;
+        const capacityTopics = topics.filter((topic) => isOpenTopic(topic) && this.#openLeafRootCount(topic.id) < maxOpen);
         // 阈值只约束「还没有任何 topic」的首次建树；已有主题但全部满仓/关闭时，
         // 即使本轮只有 1 条想法也要另起候选主题，否则新问题会永久留在 step 下。
-        if (topics.length === 0 && claimCount < this.config.topicSeedMinClaims) return null;
+        if (topics.length === 0) {
+            if (claimCount < this.config.topicSeedMinClaims) return null;
+        } else if (capacityTopics.length > 0) {
+            // 有容量但都与意图无关：用户换了研究问题，至少两条想法才另起主题，
+            // 避免一句「无需发布云端」也生成一个新主题。
+            if (claimCount < Math.min(2, this.config.topicSeedMinClaims)) return null;
+        }
         const raw = String(step.title ?? '').replace(/^第\s*\d+\s*轮[：:]\s*/u, '').trim();
         const title = clampText(raw.length >= 4 ? raw : '本轮研究', 60);
         const topic = await this.#addNode({
@@ -1434,12 +1555,22 @@ export class ResearchExtractor {
                 roots.push(node.id);
             }
         }
-        const fallback = roots[roots.length - 1] ?? null;
-        if (fallback !== null) {
-            for (const node of direct) {
-                if (roots.includes(node.id)) continue;
-                await this.store.apply({ t: 'moveNode', id: node.id, parentId: fallback });
+        for (const node of direct) {
+            if (roots.includes(node.id)) continue;
+            // 依赖型想法只在确实相似时挂到某个叶根；否则直接挂到本轮 topic，
+            // 而不是塞给「最后一个 approach」，避免造出错误父子关系。
+            let best = null;
+            for (const rootId of roots) {
+                const root = this.store.state.nodes.get(rootId);
+                if (root === undefined) continue;
+                const score = similarity(
+                    `${node.title ?? ''} ${node.summary ?? ''}`,
+                    `${root.title ?? ''} ${root.summary ?? ''}`,
+                );
+                if (score < this.config.intraTurnLinkThreshold) continue;
+                if (best === null || score > best.score) best = { id: rootId, score };
             }
+            await this.store.apply({ t: 'moveNode', id: node.id, parentId: best?.id ?? topic.id });
         }
         const topicNode = this.store.state.nodes.get(topic.id);
         if (topicNode !== undefined && typeof topicDigest === 'function') {
@@ -1579,7 +1710,7 @@ export class ResearchExtractor {
             const rawParentId = typeof claim.parentId === 'string' && turnParentIds.has(claim.parentId)
                 ? claim.parentId
                 : payload.stepId;
-            const parentId = this.#topicAwareParent(claim.kind, rawParentId, payload.stepId, runtime, payload.sessionId);
+            const parentId = this.#topicAwareParent(claim.kind, `${title} ${typeof claim.summary === 'string' ? claim.summary : ''}`, rawParentId, payload.stepId, runtime, payload.sessionId);
             const node = await this.#addOrHit({
                 parentId,
                 kind: claim.kind,
@@ -1615,8 +1746,9 @@ export class ResearchExtractor {
         const step = stepId !== null ? state.nodes.get(stepId) : undefined;
         if (step === undefined) return null;
         const title = conclusionTitle(text);
+        if (GENERIC_CONCLUSION_TITLE.test(title)) return null;
         const conclusion = await this.#addOrHit({
-            parentId: this.#topicAwareParent('conclusion', step.id, step.id, runtime, event.sessionId),
+            parentId: this.#topicAwareParent('conclusion', text, step.id, step.id, runtime, event.sessionId),
             kind: 'conclusion',
             title: clampText(title, this.config.maxTitleChars),
             summary: text,
@@ -1667,6 +1799,7 @@ export class ResearchExtractor {
                 claims: new Map(),
                 claimNodes: new Map(),
                 claimCreatedNodes: new Set(),
+                claimBlock: 0,
                 claimSeq: 0,
                 foldedNotes: [],
                 narrationCount: 0,

@@ -5,7 +5,8 @@
  *  1. 旁路观察：`session/event` → 翻译 → 确定性提取器 → 工作区研究图（不改对话、不改前缀）；
  *     进入旧会话时还会用 `session/created` + `snapshotEvents()` 回放历史（补建树）；
  *  2. 模型接口：两个固定工具 `explore_tree` / `explore_tree_record`；
- *  3. 人看：会话上栏 `conversation.view` 页签（「研究轨迹」），数据来自 `/explore-tree/snapshot`。
+ *  3. 人看：会话上栏 `conversation.view` 页签、设置分区与右侧栏预览（可选依赖），
+ *     数据来自 `/explore-tree/snapshot`。
  *
  * 依赖的宿主服务都用 `inject` 声明；webServer 是可选的（headless 环境也能只用工具）。
  *
@@ -105,6 +106,16 @@ export function apply(ctx, rawConfig) {
         if (runtime !== undefined && runtime !== null) {
             service.attachLlm(runtime);
             logger.info?.('[explore-tree] 已接入宿主 llm 服务（llm.enabled 决定是否实际调用）。');
+        }
+    });
+
+    // 可选 Agent Teams 协作：有 Team 服务时，team 动作读取真实成员/任务；
+    // 没有时保持树侧租约视图，插件仍可独立工作。
+    ctx.inject(['agentTeams'], (teamCtx) => {
+        const team = teamCtx.agentTeams ?? (typeof teamCtx.get === 'function' ? teamCtx.get('agentTeams') : undefined);
+        if (team !== undefined && team !== null) {
+            service.attachAgentTeams(team);
+            logger.info?.('[explore-tree] 已接入 Agent Teams：team 动作读取真实成员与任务。');
         }
     });
 

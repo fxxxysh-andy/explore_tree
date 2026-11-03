@@ -32,6 +32,8 @@ export const DEFAULT_CONFIG = Object.freeze({
     topicSeedMinClaims: 5,
     /** 单个 topic 最多承接的未决叶根；满仓后新想法优先挂到其他主题/另起候选主题。 */
     maxOpenLeavesPerTopic: 9,
+    /** 用户意图与 topic 的最低词面相似度；低于它视为新请求，不再复用旧主题。 */
+    topicIntentThreshold: 0.12,
     /** 轮首向模型注入「研究轨迹简报」（仅当图里已有 topic；默认开，可在设置里关）。 */
     injectBrief: true,
     /** 简报范围：workspace=含同工作区其他 goal 的主干（多 agent 默认）；goal=只看当前会话 goal。 */
@@ -201,6 +203,7 @@ export function normalizeConfig(raw) {
         autoSeedTopic: bool(extract.autoSeedTopic ?? input.autoSeedTopic, DEFAULT_CONFIG.autoSeedTopic),
         topicSeedMinClaims: num(extract.topicSeedMinClaims ?? input.topicSeedMinClaims, DEFAULT_CONFIG.topicSeedMinClaims, 1, 50),
         maxOpenLeavesPerTopic: num(extract.maxOpenLeavesPerTopic ?? input.maxOpenLeavesPerTopic, DEFAULT_CONFIG.maxOpenLeavesPerTopic, 1, 100),
+        topicIntentThreshold: floatNum(extract.topicIntentThreshold ?? input.topicIntentThreshold, DEFAULT_CONFIG.topicIntentThreshold, 0, 1),
         injectBrief: bool(input.injectBrief ?? extract.injectBrief, DEFAULT_CONFIG.injectBrief),
         briefScope: briefScopeOf(input.briefScope ?? extract.briefScope),
         ignoreTools: stringList(extract.ignoreTools ?? input.ignoreTools, DEFAULT_CONFIG.ignoreTools),
@@ -263,6 +266,7 @@ export function extractConfigOf(config) {
         autoSeedTopic: config.autoSeedTopic,
         topicSeedMinClaims: config.topicSeedMinClaims,
         maxOpenLeavesPerTopic: config.maxOpenLeavesPerTopic,
+        topicIntentThreshold: config.topicIntentThreshold,
         ignoreTools: config.ignoreTools,
         compactLegacyActions: config.compactLegacyActions,
         repairOrphanSteps: config.repairOrphanSteps,

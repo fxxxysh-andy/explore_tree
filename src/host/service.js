@@ -115,12 +115,50 @@ export class ResearchTraceService {
         this.closed = false;
         /** 宿主 llm 服务（注入后才有；默认关闭 LLM 时不使用）。 */
         this.llmRuntime = null;
+        /** 可选 Agent Teams 服务；缺失时 team 只显示树侧租约。 */
+        this.agentTeams = null;
         /** sessionId → 已注入 brief 的轮次（同一轮不重复注入）。 */
         this.briefInjections = new Map();
         /** sessionId → 上次注入简报时的节点签名（下一次只推增量）。 */
         this.briefSnapshots = new Map();
         /** compaction/end 后强制补一次完整简报。 */
         this.briefForced = new Set();
+    }
+
+    /**
+     * 注入 Agent Teams 服务（可选）。Team 插件不存在时保持 null，team 动作仍可用树侧租约。
+     * @param {object|null} service ctx.agentTeams
+     */
+    attachAgentTeams(service) {
+        this.agentTeams = service ?? null;
+    }
+
+    /**
+     * 读取当前调用者所在 Team 的真实成员与任务。调用者必须是 exact live Agent；
+     * 服务缺失或调用失败时返回 available=false，由渲染层降级，不影响树侧协作信息。
+     * @param {object} exec 工具执行上下文
+     */
+    async teamContext(exec) {
+        const agent = exec?.agent;
+        if (this.agentTeams === null || agent === undefined || agent === null) {
+            return {
+                available: false,
+                error: this.agentTeams === null ? 'Agent Teams 服务未接入（未安装/未启用）' : '缺少调用者 Agent',
+            };
+        }
+        try {
+            const [members, tasks] = await Promise.all([
+                this.agentTeams.listMembers(agent),
+                this.agentTeams.listTasks(agent),
+            ]);
+            return {
+                available: true,
+                members: Array.isArray(members) ? members : [],
+                tasks: Array.isArray(tasks) ? tasks : [],
+            };
+        } catch (error) {
+            return { available: false, error: error instanceof Error ? error.message : String(error) };
+        }
     }
 
     /**
@@ -796,13 +834,14 @@ export class ResearchTraceService {
                     }
                     root = first.root;
                 }
-                const canonical = canonicalWorkspaceRoot(root);
-                if (!(await this.allowsRoot(canonical))) {
+                // allowsRoot/snapshotFor 都会 canonical 化；这里传原始路径，避免同一请求
+                // 额外做一次同步 realpathSync。
+                if (!(await this.allowsRoot(root))) {
                     sendJson(res, 404, { ok: false, error: 'workspace not found or not allowed' });
                     return;
                 }
                 const focus = url.searchParams.get('focus');
-                sendJson(res, 200, await this.snapshotFor(canonical, { focusId: focus ?? undefined }));
+                sendJson(res, 200, await this.snapshotFor(root, { focusId: focus ?? undefined }));
                 return;
             }
             if (pathname === '/explore-tree/health') {

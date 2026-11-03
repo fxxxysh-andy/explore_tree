@@ -309,7 +309,7 @@ function resolveFocus(state, focusId) {
 }
 
 /** 假设是否有证据：子树里的 evidence，或跨轮 supports/refines 边从证据/结论指向它。 */
-function hasEvidence(state, id) {
+export function hasEvidence(state, id) {
     if (hasEvidenceInSubtree(state, id)) return true;
     return edgesOf(state, id).some((edge) => {
         if (edge.to !== id || (edge.kind !== 'supports' && edge.kind !== 'refines')) return false;
@@ -321,7 +321,7 @@ function hasEvidence(state, id) {
 }
 
 /** 假设是否被 contradicts 边否定（证据/死路 → 假设）。 */
-function hasContradiction(state, id) {
+export function hasContradiction(state, id) {
     return edgesOf(state, id).some((edge) => {
         if (edge.to !== id || edge.kind !== 'contradicts') return false;
         const other = state.nodes.get(edge.from);

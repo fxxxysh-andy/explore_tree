@@ -1,5 +1,241 @@
 # Changelog
 
+## 0.26.3 — 2026-11-03
+
+### 修复（右侧栏「开始」页整页空白）
+
+- **根因**：v0.26 注册右侧栏 tab 时，`guide` 条目的 `title` / `description` 写成了字符串；
+  宿主 `GuideBody` 直接调用 `entry.title()` 与 `entry.description?.()`，渲染第一个条目就抛
+  `TypeError: entry.title is not a function`，导致整个「开始」页（不只是研究轨迹卡片）空白。
+  用户装的 `dsh-better-sidebar` 自己的文件/Git/任务等卡片也一起被这次异常挡住。
+- **修复**：`lib/client.js` 的 guide 条目改为函数：`title: function () { return '研究轨迹'; }`、
+  `description: function () { return '当前会话的研究树目标、未决与下一步'; }`。
+- **回归**：`test/unit/client.test.js` 的注册用例改为断言 `guide[0].title` 与
+  `guide[0].description` 都是函数且返回值正确，防止再次退回字符串。
+
+### 验证
+
+- 真实 DSH Web（`explore-scratch`，3099）headless 复现：修复前右栏 guide 为空，控制台
+  `TypeError: entry.title is not a function`；修复后 guide 同时列出「文件 / 研究轨迹 / Git /
+  新建终端 / 任务管理 / 侧边对话」，控制台无异常。
+- `npm test`：203 项 / 13 suites 全过；`npm run check`、`git diff --check` 通过。
+
+### 边界
+
+- 只影响右侧栏 guide 的注册数据，不改变主「研究轨迹」页签与预览内容。
+- 宿主右侧栏插件未安装时仍只注册会话页签与设置分区。
+
+## 0.26.2 — 2026-11-03
+
+### 修复（右侧栏注册韧性）
+
+- **导航与页签拆分可选注入**：原先把 `sidebarRightTabs` 与 `sidebarRight` 合成一个
+  `ctx.inject`，导航服务暂时不可用或 HMR 重载时整个回调都不执行，旧页签留下来、body
+  却没注册，表现为「研究轨迹」页签点开整片空白。现在拆成两个独立注入：页签类型与 body
+  只依赖 `sidebarRightTabs`，导航控制器单独注入。
+- **body 先于页签类型注册**：`sidebarRightTabs.register` 对重复 id 会抛错；body 若在其后
+  注册就会缺失。现在先注册 `sidebar.right.pane.tab`，再注册类型；重复 id 只保留旧 bundle
+  的页签定义，不再让 body 消失。
+- **导航服务晚到也补开**：面板先挂载、`sidebarRight` 后就绪时，记录待展开会话，服务到位后
+  补开右侧栏一次，不再因为首次 effect 跑在导航之前而永远不展开。
+
+### 验证
+
+- `npm test`：203 项 / 13 suites 全过；`npm run check`、`git diff --check` 通过。
+- `test/unit/client.test.js`：10 项，新增「页签类型 id 已被旧 bundle 占用时仍注册右侧栏 body，
+  不留空白页签」；注册断言改为两个独立可选注入。
+
+### 边界
+
+- 重复 id 时旧 bundle 的 title/guide 定义保留到下次刷新；body 使用新代码。
+- 宿主始终没有 `sidebarRightTabs` 时仍只注册会话页签与设置分区，不影响主面板。
+- 导航服务始终不可用时工具栏按钮禁用，但已打开的页签仍能渲染 body。
+
+## 0.26.1 — 2026-11-03
+
+### 修复（右侧栏预览不可见）
+
+- **右侧栏预览有了明确入口**：右栏 tab 类型注册后只会出现在右栏的 guide 里，右栏收起或
+  停在其他页时用户看不到「研究轨迹」。主面板工具栏在「最新」后新增「右侧栏」按钮，
+  调用宿主 `ctx.sidebarRight.openTab('research-tree')`：右栏会展开并切到预览页。
+  宿主缺少 `openTab` 时按钮禁用并提示「右侧栏插件不可用」，不影响 tab 类型注册。
+- **首次进入会话的研究轨迹页自动展开一次**：`ExploreTreePanel` 挂载时按 `sessionId`
+  记录，只在第一次自动打开预览；用户关掉后同一会话不再强制展开，仍可用工具栏按钮重开。
+- 右侧栏注册的可选注入从 `['sidebarRightTabs']` 扩为
+  `['sidebarRightTabs', 'sidebarRight']`，只多取导航控制器，缺一个都不会让主面板失败。
+
+### 验证
+
+- `npm test`：202 项 / 13 suites 全过；`npm run check` 通过；`git diff --check` 通过。
+- `test/unit/client.test.js`：9 项，新增「工具栏的『右侧栏』按钮调用 sidebarRight.openTab」；
+  注册断言改为两个可选注入；右侧栏预览空状态仍覆盖。
+
+### 边界
+
+- 自动展开只发生在打开「研究轨迹」页签的会话，不会在普通「对话」页强行展开右栏。
+- 同一会话关掉预览后不再自动打开；切换会话会按新会话首次进入再展开一次。
+- 预览内容仍是快照只读，不替代完整画布；右栏宽度/分屏由宿主右侧栏插件管理。
+
+## 0.26.0 — 2026-11-03
+
+### 新增（与 Agent Teams 协作 + 右侧栏研究轨迹预览）
+
+- **`team` 从独立任务板改为 Agent Teams 协作视图**：
+  - 插件通过可选 `ctx.inject(['agentTeams'])` 接入宿主 TeamService；`teamContext(exec)`
+    用当前执行者的 exact live Agent 调 `listMembers/listTasks`，读取真实成员与任务。
+  - Team 任务的 `description` 若含 `[explore-tree:n12]` 标记，会解析为节点关联；
+    `team` 输出已关联/未关联任务、成员状态，并保留树侧我的主题/待认领/租约过期/冲突。
+  - 不再生成第二套任务列表；只对「没有同节点任务」的可认领主题输出 `taskSuggestions`
+    与 `team_task_create` 命令模板，任务仍由 Team 插件创建，树与任务不双写状态。
+  - 没有 Team 插件或调用失败时返回 `available:false` 并降级为树侧租约，不伪造任务。
+- **右侧栏预览**：新增 `sidebar.right.pane.tab` 槽位（tab id `research-tree`）。
+  可选注入 `sidebarRightTabs`，只在宿主装有右侧栏插件时注册；
+  预览按当前会话工作区读取 snapshot，显示当前目标、节点/未决/关系计数、可见未决前 3 项
+  （可展开摘要）与第一条 frontier 建议，底部提示完整视图在会话上方的「研究轨迹」页签。
+- `topicTaskPayload` 增加 `marker` 字段，description 首行写节点标记；新增
+  `teamTaskMarker` / `parseTeamTaskMarker` 纯函数。
+
+### 验证
+
+- `npm test`：201 项 / 13 suites 全过；`npm run check` 通过；`git diff --check` 通过。
+- 新增/更新测试：`test/unit/navigate.test.js` 覆盖真实 Team 合并、标记挂回节点、
+  deleted 任务过滤、已有任务不重复建议、无 Team 降级；`test/unit/host.test.js` 覆盖
+  `attachAgentTeams` 后的真实成员/任务读取；`test/unit/client.test.js` 覆盖三槽位注册、
+  tab 定义、右侧栏预览空状态。
+- 现场图（v0.25 时约 1069 节点）仍可只读调用 walk/team；team 在无 Team 服务时输出
+  「Agent Teams：未接入」。
+
+### 边界
+
+- Team 调用要求 exact live Agent；无 `exec.agent` 时返回「缺少调用者 Agent」。
+- 标记只做展示关联，不校验节点是否存在；找不到节点时任务进 `unlinked`，不删除任务。
+- 任务创建/认领/完成仍用 Team 插件工具；树侧 `assign` 与 Team owner 不自动同步。
+- 右侧栏预览依赖宿主右侧栏客户端插件；缺失时不注册、不影响会话页签与设置页。
+
+## 0.25.0 — 2026-11-03
+
+### 新增（辅助 AI 沿树展开 + 多 agent 协作板）
+
+- **`explore_tree action=walk`**：沿当前分支展开。优先用显式 `id`/`focus`，否则用会话游标
+  （`activeNodeId` → `goalId` → 最新 goal → 根），不再落到最新一条 action。返回：
+  - 根路径、焦点、父级、兄弟分支、子节点（子树规模/未决后代/是否还有子节点）；
+  - 当前子树的未决叶（最多 `limit` 条）；
+  - 缺口：无主题、主题无叶、主题超宽、主题冲突、摘要过期、主题未认领、问题无假设、
+    假设无证据/被反驳、决策无依据、step 时间桶、开放叶子未展开；
+  - 下一步：`descend`（沿开放子节点）、`expand`（开放叶子）、`branch`（最近开放兄弟）、
+    `resume`（同主题其他未决叶）或 `stopped`；`expand` 附带按 kind 生成的
+    `explore_tree_record add` 模板，可直接执行；
+  - 局部建议：验证/收敛/认领/拆主题/迁移 step 下语义节点/死路 reopen；
+  - 显式 `id`/`focus` 不存在时返回 `ok:false`，不静默回退到会话游标。
+- **`explore_tree action=team`**：多 agent 协作板。按 `actor` 汇总：
+  - 我的主题（含租约/优先级/未决叶/冲突/摘要过期）、他人主题、未认领、租约过期、可认领；
+  - 每个可认领 topic 的 `topicTaskPayload`（subject/description/tags），可直接映射
+    `team_task_create`；`writeScopes` 仍需调用方按实际文件补；
+  - 建议：续租、认领、裁决冲突、重算摘要、拆分超宽主题；`assign` 命令使用当前 actor；
+  - 长列表在文本头部标注「显示 N/总数」，避免把限量条数当全量。
+- 新模块 `src/core/navigate.js`：纯函数 `resolveWalkFocus` / `computeWalk` /
+  `renderWalk` / `computeTeamBoard` / `renderTeamBoard`，不读文件、不写图、不调模型。
+  `frontier.js` 导出 `hasEvidence` / `hasContradiction` 供复用。
+- `src/host/tools.js`：只读 action 增加 `walk` / `team`；read 参数增加 `actor`；
+  工具描述与静态提示段补使用约定（沿树推进用 walk；认领/交接前先 team）。
+
+### 验证
+
+- `npm test`：199 项 / 13 suites 全过；`npm run check` 新增 `src/core/navigate.js` 语法检查。
+- 新增 `test/unit/navigate.test.js` 9 项：焦点解析、路径/子节点/未决叶/下一步、开放叶子的
+  expand 模板、关闭焦点转向兄弟、主题超宽缺口与 split 建议、空图 seed、team 的
+  mine/unowned/expired/others/claimable/tasks/suggestions、空图提示。
+- `test/unit/host.test.js` 增加工具集成：walk 沿 topic 展开并给 descend；assign 后 team 识别
+  「我的主题」；不存在的 id 返回 `ok:false`。
+- 现场图 1069 节点/26 active topic 冒烟：walk 1ms、team 9ms，文本分别约 0.9KB/1.5KB。
+
+### 边界
+
+- 两个 action 都只读；返回的命令是模板，不自动执行，也不自动创建/改写 Team 任务。
+- `team` 的「我的主题」按显式 actor 或会话 id 过滤；租约状态只按当前时间计算，不做抢占。
+- `walk` 的未决叶与子节点有上限（默认 6/8，limit 最大 12/20），超出只显示计数；
+  深树/宽主题的遍历按焦点子树计算，不返回整棵树。
+- `walk` 的下一步以「开放子节点优先」为启发式，不替代完整 frontier；全局换方向仍用
+  `frontier`/`overview`。
+## 0.24.0 — 2026-11-03
+
+### 改进（提取内容更准确、更必要，关系更合理）
+
+- **分类质量门**：分类器不再「命中关键词就落节点」，按 kind 做二次校验；被拒候选降为
+  `note`（`features.qualityGate` 带原因），只进轮次摘要，不再变成永久 open 的未决。
+  - `question` 必须是真疑问句，拒绝行动指令（Look/Check/Read…）、「What about」「How about」
+    与过短标题；
+  - `hypothesis` 拒绝计划句与短标题，且必须有推测/条件/因果等机制信号；显式「假设：」标签豁免；
+  - `decision` 必须有明确取舍（决定/选择/采用/改为/rather than/instead of…），单独的 need/should/plan 不算；
+  - `evidence` 把 Given/Since 开头的推理前提折叠，普通句要有观察信号或具体数字；显式「证据：」标签豁免；
+  - `conclusion` 拒绝 Fine/Plan/Next 等泛化标题，以及 should/need/maybe 开头的行动句。
+  - `cleanTitle` 去掉 And/But/However/Given/Perhaps 等前缀与破折号开头的 if/then/so。
+- **关系**：
+  - 删除「无相似候选就挂本轮最近 approach」的回退；依赖型 claim 只有相似度达到
+    `intraTurnLinkThreshold`，或与同段最后一条 approach（中间可夹 note）同段时才挂到它下面，
+    否则回 step/topic 本身。修复「无关证据被挂在旧假设下」。
+  - 新增同轮 typed edge（`#linkTurnEdges`）：新节点与同轮更早节点只连一条最相关关系，父子分数按 1；
+    evidence→hypothesis/question/decision 为 supports（含否定词为 contradicts）、conclusion→hypothesis
+    supports / decision 与 conclusion refines、dead_end→hypothesis contradicts、decision→decision replaces /
+    question 与 hypothesis refines、hypothesis→hypothesis/decision/conclusion refines、question related。
+    跨轮 `#linkThreadEdges` 与同轮都先用 `#edgeExists` 去重。
+- **主题意图漂移**：新增 `topicIntentThreshold`（默认 0.12）。`#turnIntentText` 取最近真人消息的
+  首句/首分句（否则 step 标题，截断到 80 字），避免整段长消息稀释 Jaccard；
+  `#topicIntentScore` 取主题标题/digest 与现有 open 叶根标题的最大词面相似度。
+  `#pickTurnTopic` 只复用「未关闭、未满仓、与意图相关」的主题，并按相关度降序选择；
+  `activeTopic` 满仓/关闭/无关时立即清空。已有主题有容量但均不相关时，`#maybeSeedTopic`
+  要求本轮至少 2 条想法才另起候选主题，避免新请求继续塞进旧主题。
+- **结论**：新增 `GENERIC_CONCLUSION_TITLE` 过滤，结论句只有 Fine/Plan/好的/完成 等标题时不再建节点。
+- **修复分类假阳性**：`selectClaims` 构造候选时漏复制 `block`，`#claimParentId` 的
+  「同段紧邻」判断把不同段落当成相邻，导致证据错挂；现在 `block` 作为轮级段落号跨
+  assistant.reasoning 事件延续，并补跨事件回归。
+- **清理**：删除已无引用的 `#latestTopicLeafRoot`。
+
+### 验证
+
+- `npm test`：189 项 / 13 suites 全过；`npm run check`、`git diff --check` 通过。
+- 新增回归：分类质量门（计划句/泛化确认/推理前提折叠为 note，显式标签保留）、无关证据不再错挂、
+  跨 assistant.reasoning 事件也不算同段紧邻、同段紧邻证据挂假设并连 supports 边、
+  typed edge 按语义选择目标（父子不成立时仍连边）、长用户消息用首句复用主题、
+  topic 意图漂移另起主题、泛化结论不建节点、`topicIntentThreshold` 配置归一化与透传。
+- 用 20 条真实坏句做人工诊断：Need likely… / Package check includes maybe / That's 2 instead of 3 /
+  Plan / Fine / Given… / What about… 均落 note；However npm pack… 判 evidence；This proves… 判 conclusion。
+
+### 边界
+
+- 质量门与同轮 typed edge 只作用于默认的 `ranked` 路径；`chronological` 仍走旧的
+  `classifyThought`，不经过质量门。
+- 同轮/跨轮关系每个新节点最多连一条，只表达最强关系，不做全量图推理。
+- 主题漂移用词面相似度，换一种说法可能判为无关并另起主题；阈值可调，主题也可在面板改名/合并。
+
+## 0.23.2 — 2026-11-03
+
+### 修复（v0.23.1 审查遗留）
+
+- **陈旧锁二次确认加入 token 比对**：清理前除 mtime/size 外再比对锁内容里的 token，
+  能挡住同尺寸、同 mtime 粒度的替换；读-删之间仍有极窄窗口，文档不再声称「完全防止」。
+- **锁等待超时复位竞争标记**：超时抛错或下一次取锁入口清零 lockContended，避免后续
+  正常释放多睡 0–3ms。
+- **设置页偏好改为单项 localStorage key**：每个布尔偏好写 explore-tree.prefs.v1.<key>，
+  整对象只作为旧版本镜像；两个标签页同时改不同项不再互相覆盖，storage 事件按前缀刷新。
+- **HTTP 快照少一次 canonical**：/explore-tree/snapshot 把原始路径交给 allowsRoot/
+  snapshotFor，不再在 handler 里额外同步 realpathSync。
+- **文档修正**：docs/design.md 中 v0.23.0 历史条目改回当时的 172 项；README 更新测试计数
+  与锁清理的 token 语义。
+
+### 验证
+
+- npm test：179 项 / 13 suites 全过；npm run check、git diff --check 通过。
+- 新增回归：store「陈旧锁 token 在二次确认时变化不得删除」「超时后复位 lockContended」；
+  client「两个标签页改不同偏好不互相覆盖，storage 事件会同步」。
+
+### 残余风险
+
+- 锁清理的 TOCTOU 只能缩小、不能消除（读 token 与 rm 之间仍可能被替换）；这是 best-effort
+  文件锁的边界，不承诺强一致。
+- 释放让出只覆盖「本次取锁失败过」的进程；连续抢回的赢家没有等待者信号，16 writer 同机
+  饱和时仍可能出现 2s 调度超时。
+
 ## 0.23.1 — 2026-11-03
 
 ### 修复（v0.23.0 Release 失败与并发锁竞争）
@@ -9,7 +245,7 @@
   host 测试的临时工作区统一返回 canonical 路径，并新增 junction 别名回归（快照 root、HTTP 节点数一致）。
 - **graph.lock 竞争不再误删活锁**：`#acquireLock` 在 EEXIST 后 `stat` 瞬时失败/ENOENT 时
   不再删除锁文件（删除会删掉其他进程刚重建或仍持有的锁，导致重复 id、journal 覆盖与丢节点）；
-  陈旧锁清理前二次 `stat` 核对 mtime/size，防止观察后被新持有者替换。
+  陈旧锁清理前二次 `stat` 核对 mtime/size，缩小观察后被新持有者替换的窗口（v0.23.2 再加 token 比对）。
 - **锁等待公平性**：EEXIST 退避由固定 25ms 改为 5–15ms 随机；本次取锁发生过竞争的进程
   在释放后让出 0–3ms，避免快速 apply 循环连续抢回、把对手饿到 2s 超时。
 - **release workflow 校验 tag 与版本**：推 `v*` tag 后先比较 `GITHUB_REF_NAME` 与

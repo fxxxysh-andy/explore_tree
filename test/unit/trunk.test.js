@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { addNode, createGraphState, linkNodes, updateNode } from '../../src/core/graph.js';
 import {
     claimableTopics,
+    parseTeamTaskMarker,
     renderHandoff,
     topicConflicts,
     digestBasisOf,
@@ -209,6 +210,9 @@ test('租约与 Team 映射：未认领/过期可认领，payload 可直接建�
     const payload = topicTaskPayload(state.nodes.get(topic.id));
     assert.equal(payload.subject, '建树算法');
     assert.ok(payload.tags.includes('explore-tree'));
+    assert.equal(payload.marker, '[explore-tree:' + topic.id + ']');
+    assert.ok(payload.description.startsWith(payload.marker + '\n'), 'description 首行必须是节点标记');
+    assert.equal(parseTeamTaskMarker(payload.description), topic.id, 'Team 任务描述能反查回主题节点');
 });
 
 test('人工摘要没有 basis 时不算过期（无法判断而不是 false positive）', () => {

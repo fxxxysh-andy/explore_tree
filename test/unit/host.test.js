@@ -73,6 +73,14 @@ describe('normalizeConfig', () => {
         assert.equal(extractConfigOf(config).maxOpenLeavesPerTopic, 4);
         assert.equal(normalizeConfig({ extract: { maxOpenLeavesPerTopic: 999 } }).maxOpenLeavesPerTopic, 100);
     });
+
+    it('topicIntentThreshold 归一化并透传到提取器配置', () => {
+        const config = normalizeConfig({ extract: { topicIntentThreshold: 0.25 } });
+        assert.equal(config.topicIntentThreshold, 0.25);
+        assert.equal(extractConfigOf(config).topicIntentThreshold, 0.25);
+        assert.equal(normalizeConfig({ extract: { topicIntentThreshold: 0 } }).topicIntentThreshold, 0);
+        assert.equal(normalizeConfig({ extract: { topicIntentThreshold: 5 } }).topicIntentThreshold, 1);
+    });
 });
 
 describe('translateSessionEvent', () => {
@@ -390,6 +398,92 @@ describe('ResearchTraceService', () => {
             assert.equal(found.ok, true);
             const state = await service.registry.get(root).then((store) => store.current());
             assert.equal(state.edges.length, 1);
+        } finally {
+            await service.dispose();
+        }
+    });
+
+    it('工具：walk 沿主题展开，team 汇总树侧认领并在无 Team 时降级', async () => {
+        const root = makeWorkspace();
+        const { ctx } = mockContext(root);
+        const service = new ResearchTraceService(ctx, normalizeConfig({}), silentLogger);
+        try {
+            const session = makeSession('s-walk-team', root);
+            const exec = { agent: { session } };
+            const [readTool, recordTool] = buildToolDefinitions(service);
+
+            await service.ingestSessionEvent(session, {
+                type: 'user/message',
+                data: { content: [{ type: 'text', text: '沿树展开多 agent 协调' }] },
+            });
+            const goal = await recordTool.execute({ action: 'add', kind: 'goal', title: '多 agent 协调' }, exec);
+            assert.equal(goal.ok, true);
+            const topic = await recordTool.execute({
+                action: 'add', parentId: goal.id, kind: 'topic', title: '缓存命中率', status: 'active',
+            }, exec);
+            assert.equal(topic.ok, true);
+            const leaf = await recordTool.execute({
+                action: 'add', parentId: topic.id, kind: 'hypothesis', title: '键格式变化导致命中率下降',
+            }, exec);
+            assert.equal(leaf.ok, true);
+
+            const walk = await readTool.execute({ action: 'walk', id: topic.id }, exec);
+            assert.equal(walk.ok, true);
+            assert.match(walk.text, /沿树展开/);
+            assert.match(walk.text, new RegExp(topic.id));
+            assert.match(walk.text, /下一步：descend/);
+
+            const assigned = await recordTool.execute({ action: 'assign', id: topic.id, owner: 'agent-a', actor: 'agent-a' }, exec);
+            assert.equal(assigned.ok, true);
+            const team = await readTool.execute({ action: 'team', actor: 'agent-a' }, exec);
+            assert.equal(team.ok, true);
+            assert.match(team.text, /研究轨迹 × Agent Teams/);
+            assert.match(team.text, /Agent Teams：未接入/);
+            assert.match(team.text, /我的主题/);
+            assert.match(team.text, new RegExp(topic.id));
+
+            const missing = await readTool.execute({ action: 'walk', id: 'n999' }, exec);
+            assert.equal(missing.ok, false);
+            assert.match(missing.text, /不存在/);
+            const missingFocus = await readTool.execute({ action: 'walk', focus: 'n999' }, exec);
+            assert.equal(missingFocus.ok, false);
+            assert.match(missingFocus.text, /焦点节点 n999 不存在/);
+        } finally {
+            await service.dispose();
+        }
+    });
+
+    it('工具：team 读取真实 Agent Teams 成员与任务，并按标记挂回节点', async () => {
+        const root = makeWorkspace();
+        const { ctx } = mockContext(root);
+        const service = new ResearchTraceService(ctx, normalizeConfig({}), silentLogger);
+        try {
+            const session = makeSession('s-team-real', root);
+            const exec = { agent: { session } };
+            const [readTool, recordTool] = buildToolDefinitions(service);
+            const goal = await recordTool.execute({ action: 'add', kind: 'goal', title: '真实团队协作' }, exec);
+            assert.equal(goal.ok, true);
+            const topic = await recordTool.execute({
+                action: 'add', parentId: goal.id, kind: 'topic', title: '缓存命中率', status: 'active',
+            }, exec);
+            assert.equal(topic.ok, true);
+
+            service.attachAgentTeams({
+                listMembers: async () => [{ name: 'lead', role: 'lead', status: 'running' }, { name: 'agent-b', role: 'teammate', status: 'inactive' }],
+                listTasks: async () => [{
+                    id: 'task-1', revision: 3, subject: '补齐命中率证据', status: 'in_progress',
+                    description: '[explore-tree:' + topic.id + ']\n沿主题补齐证据', ownerName: 'agent-b',
+                    blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [],
+                }],
+            });
+            const team = await readTool.execute({ action: 'team', actor: 'agent-a' }, exec);
+            assert.equal(team.ok, true);
+            assert.match(team.text, /研究轨迹 × Agent Teams/);
+            assert.match(team.text, /成员 2/);
+            assert.match(team.text, /已关联任务（1）/);
+            assert.match(team.text, /task-1/);
+            assert.match(team.text, new RegExp(topic.id));
+            assert.ok(!team.text.includes('Agent Teams：未接入'));
         } finally {
             await service.dispose();
         }
