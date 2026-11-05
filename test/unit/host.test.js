@@ -81,6 +81,14 @@ describe('normalizeConfig', () => {
         assert.equal(normalizeConfig({ extract: { topicIntentThreshold: 0 } }).topicIntentThreshold, 0);
         assert.equal(normalizeConfig({ extract: { topicIntentThreshold: 5 } }).topicIntentThreshold, 1);
     });
+
+    it('briefMaxChars 默认 1200，可配置并夹到 200..4000', () => {
+        assert.equal(normalizeConfig({}).briefMaxChars, 1200);
+        assert.equal(normalizeConfig({ briefMaxChars: 1800 }).briefMaxChars, 1800);
+        assert.equal(normalizeConfig({ extract: { briefMaxChars: 600 } }).briefMaxChars, 600);
+        assert.equal(normalizeConfig({ briefMaxChars: 1 }).briefMaxChars, 200);
+        assert.equal(normalizeConfig({ briefMaxChars: 99999 }).briefMaxChars, 4000);
+    });
 });
 
 describe('translateSessionEvent', () => {
@@ -336,6 +344,95 @@ describe('ResearchTraceService', () => {
         }
     });
 
+    it('AI 解析：POST 调模型、结果缓存、支持 force 与 GET 读缓存', async () => {
+        const root = makeWorkspace();
+        const { ctx } = mockContext(root);
+        const service = new ResearchTraceService(ctx, normalizeConfig({
+            analysis: { provider: 'deepseek', model: 'deepseek-chat', cacheTtlMs: 600000 },
+        }), silentLogger);
+        const calls = [];
+        service.attachLlm({
+            async prepareCall(config) {
+                calls.push({ config });
+                return {
+                    config,
+                    stream: async function* stream() {
+                        yield { type: 'text-delta', text: '{"headline":"聚焦缓存",' };
+                        yield { type: 'text-delta', text: '"summary":"当前在验证键格式。","findings":[{"kind":"progress","title":"定位到键格式","detail":"命中率 71%"}],"recommendations":[{"title":"补对照实验","detail":"确认因果"}]}' };
+                        yield { type: 'finish', reason: { kind: 'stop' } };
+                    },
+                };
+            },
+        });
+        try {
+            await service.ingestSessionEvent(makeSession('s-ai', root), { type: 'user/message', data: { content: [{ type: 'text', text: '目标：排查缓存命中率下降' }] } });
+            const first = await httpRequest(service, {
+                method: 'POST',
+                url: '/explore-tree/analyze?workspace=' + encodeURIComponent(root),
+            });
+            assert.equal(first.status, 200);
+            assert.equal(first.body.ok, true);
+            assert.equal(first.body.analysis.headline, '聚焦缓存');
+            assert.equal(first.body.analysis.findings.length, 1);
+            assert.equal(first.body.meta.cached, false);
+            assert.equal(calls.length, 1);
+
+            const second = await httpRequest(service, {
+                method: 'POST',
+                url: '/explore-tree/analyze?workspace=' + encodeURIComponent(root),
+            });
+            assert.equal(second.status, 200);
+            assert.equal(second.body.meta.cached, true, 'TTL 内直接复用缓存');
+            assert.equal(calls.length, 1, '缓存命中不再扣费');
+
+            const forced = await httpRequest(service, {
+                method: 'POST',
+                url: '/explore-tree/analyze?workspace=' + encodeURIComponent(root) + '&force=1',
+            });
+            assert.equal(forced.status, 200);
+            assert.equal(forced.body.meta.cached, false);
+            assert.equal(calls.length, 2);
+
+            const status = await httpRequest(service, {
+                method: 'GET',
+                url: '/explore-tree/analyze?workspace=' + encodeURIComponent(root),
+            });
+            assert.equal(status.status, 200);
+            assert.equal(status.body.configured, true);
+            assert.equal(status.body.analysis.headline, '聚焦缓存');
+            assert.equal(typeof status.body.cachedAt, 'string');
+
+            const foreign = await httpRequest(service, {
+                method: 'POST',
+                url: '/explore-tree/analyze?workspace=' + encodeURIComponent(root),
+                headers: { origin: 'https://evil.example' },
+            });
+            assert.equal(foreign.status, 403, '跨站 Origin 不得触发模型调用');
+            assert.equal(calls.length, 2);
+        } finally {
+            await service.dispose();
+        }
+    });
+
+    it('AI 解析：未注入 llm 或未配置路由时返回可读错误', async () => {
+        const root = makeWorkspace();
+        const { ctx } = mockContext(root);
+        const service = new ResearchTraceService(ctx, normalizeConfig({}), silentLogger);
+        try {
+            await service.ingestSessionEvent(makeSession('s-ai2', root), { type: 'user/message', data: { content: [{ type: 'text', text: '目标：没有模型也要能解释' }] } });
+            const unavailable = await httpRequest(service, { method: 'POST', url: '/explore-tree/analyze?workspace=' + encodeURIComponent(root) });
+            assert.equal(unavailable.status, 503);
+            assert.equal(unavailable.body.code, 'llm_unavailable');
+
+            service.attachLlm({ prepareCall: async () => ({ config: {}, stream: async function* () {} }) });
+            const unconfigured = await httpRequest(service, { method: 'POST', url: '/explore-tree/analyze?workspace=' + encodeURIComponent(root) });
+            assert.equal(unconfigured.status, 400);
+            assert.equal(unconfigured.body.code, 'llm_not_configured');
+        } finally {
+            await service.dispose();
+        }
+    });
+
     it('别名/短路径访问同一工作区时复用 canonical store', async () => {
         const root = makeWorkspace();
         const aliasParent = fs.mkdtempSync(path.join(os.tmpdir(), 'explore-tree-alias-'));
@@ -398,6 +495,45 @@ describe('ResearchTraceService', () => {
             assert.equal(found.ok, true);
             const state = await service.registry.get(root).then((store) => store.current());
             assert.equal(state.edges.length, 1);
+        } finally {
+            await service.dispose();
+        }
+    });
+
+    it('工具：问题关闭必须给 solved/dead_end，原因落库且重开清空', async () => {
+        const root = makeWorkspace();
+        const { ctx } = mockContext(root);
+        const service = new ResearchTraceService(ctx, normalizeConfig({}), silentLogger);
+        try {
+            const session = makeSession('s-close-reason', root);
+            const exec = { agent: { session } };
+            const [, recordTool] = buildToolDefinitions(service);
+            const goal = await recordTool.execute({ action: 'add', kind: 'goal', title: '关闭原因' }, exec);
+            const topic = await recordTool.execute({ action: 'add', kind: 'topic', parentId: goal.id, title: '状态口径' }, exec);
+            const question = await recordTool.execute({ action: 'add', kind: 'question', parentId: topic.id, title: '是否需要 closeReason？' }, exec);
+
+            const missing = await recordTool.execute({ action: 'close', id: question.id }, exec);
+            assert.equal(missing.ok, false, '问题关闭没有原因必须拒绝');
+            const solved = await recordTool.execute({ action: 'close', id: question.id, closeReason: 'solved', reason: '已确认' }, exec);
+            assert.equal(solved.ok, true);
+            let store = await service.registry.get(root);
+            let node = store.state.nodes.get(question.id);
+            assert.equal(node.status, 'done');
+            assert.equal(node.closeReason, 'solved');
+            assert.equal(node.resolutionBy, 'human');
+
+            const reopened = await recordTool.execute({ action: 'reopen', id: question.id, reason: '出现新证据' }, exec);
+            assert.equal(reopened.ok, true);
+            node = (await store.current()).nodes.get(question.id);
+            assert.equal(node.closeReason, null);
+            assert.equal(node.resolutionBy, null);
+
+            const drop = await recordTool.execute({ action: 'add', kind: 'question', parentId: topic.id, title: '重复问题' }, exec);
+            const merged = await recordTool.execute({ action: 'merge', id: question.id, dropId: drop.id, closeReason: 'superseded' }, exec);
+            assert.equal(merged.ok, true);
+            node = (await (await service.registry.get(root)).current()).nodes.get(drop.id);
+            assert.equal(node.closeReason, 'superseded');
+            assert.equal(node.resolutionBy, 'auto');
         } finally {
             await service.dispose();
         }
@@ -851,7 +987,7 @@ describe('P5 摘要主干与叶节点', () => {
             assert.equal(brief.ok, true);
             assert.match(brief.text, /【研究轨迹简报】/);
             assert.match(brief.text, /建树算法/);
-            assert.ok(brief.text.length <= 400, `brief 应 ≤400 字，实际 ${brief.text.length}`);
+            assert.ok(brief.text.length <= 1200, `brief 应 ≤1200 字，实际 ${brief.text.length}`);
 
             const assigned = await recordTool.execute({ action: 'assign', id: topic.id, owner: 'agent-1' }, exec);
             assert.equal(assigned.ok, true);
@@ -1111,7 +1247,7 @@ describe('P1 轮首简报注入', () => {
             assert.match(full.messages[1].content[0].text, /研究轨迹简报/);
 
             await recordTool.execute({ action: 'add', kind: 'conclusion', parentId: topic.id, title: '缓存键会随版本变化', status: 'done' }, exec);
-            await recordTool.execute({ action: 'close', id: question.id, reason: '已通过实验确认' }, exec);
+            await recordTool.execute({ action: 'close', id: question.id, closeReason: 'solved', reason: '已通过实验确认' }, exec);
             const delta = await service.injectBrief(decision, { session, turn: 2, step: 1 });
             assert.equal(delta.messages.length, 2);
             const text = delta.messages[1].content[0].text;
@@ -1138,6 +1274,31 @@ describe('P1 轮首简报注入', () => {
         }
     });
 });
+
+function httpRequest(service, options) {
+    return new Promise((resolve, reject) => {
+        const req = {
+            method: options.method ?? 'GET',
+            url: options.url,
+            headers: options.headers ?? {},
+            socket: { remoteAddress: options.remoteAddress ?? '127.0.0.1' },
+        };
+        let body = '';
+        const res = {
+            statusCode: 0,
+            setHeader() {},
+            end(chunk) {
+                body += chunk;
+                try {
+                    resolve({ status: this.statusCode, body: JSON.parse(body) });
+                } catch (error) {
+                    reject(error);
+                }
+            },
+        };
+        service.handleHttp(req, res).catch(reject);
+    });
+}
 
 function httpGet(service, url, remoteAddress = '127.0.0.1') {
     return new Promise((resolve, reject) => {

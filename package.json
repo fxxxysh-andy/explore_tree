@@ -1,6 +1,6 @@
 {
   "name": "dsh-explore-tree",
-  "version": "0.26.3",
+  "version": "0.31.0",
   "description": "研究轨迹：以树状结构记录大模型研究工作区的研究图，提供观测工具、探索建议与 DSH 内可视化。",
   "type": "module",
   "main": "src/index.js",
@@ -16,7 +16,8 @@
     "cordis.patch.yml",
     "README.md",
     "CHANGELOG.md",
-    "docs/design.md"
+    "docs/design.md",
+    "docs/schema.md"
   ],
   "keywords": [
     "deepseek",
@@ -42,12 +43,13 @@
   },
   "scripts": {
     "test": "node --test \"test/unit/*.test.js\"",
-    "check": "node --check src/index.js && node --check lib/client.js && node --check src/core/extract.js && node --check src/core/store.js && node --check src/core/hygiene.js && node --check src/core/select.js && node --check src/core/compact.js && node --check src/core/frontier.js && node --check src/core/trunk.js && node --check src/core/navigate.js && node --check src/host/service.js",
+    "check": "node --check src/index.js && node --check lib/client.js && node --check src/core/extract.js && node --check src/core/store.js && node --check src/core/hygiene.js && node --check src/core/select.js && node --check src/core/status.js && node --check src/core/migrate-close-reason.js && node --check src/core/compact.js && node --check src/core/frontier.js && node --check src/core/trunk.js && node --check src/core/navigate.js && node --check src/host/service.js",
     "e2e:install": "node scripts/install.mjs --profile explore-scratch --create",
     "e2e:smoke": "node scripts/smoke.mjs --profile explore-scratch --boot --path /explore-tree/health",
     "e2e:uninstall": "node scripts/uninstall.mjs --profile explore-scratch",
     "audit-graph": "node scripts/audit-graph.mjs",
     "rebuild-graph": "node scripts/rebuild.mjs",
-    "migrate-trunk": "node scripts/migrate-trunk.mjs"
+    "migrate-trunk": "node scripts/migrate-trunk.mjs",
+    "migrate-close-reason": "node scripts/migrate-close-reason.mjs"
   }
 }

@@ -61,6 +61,53 @@ export function normalizePriority(value) {
 /** 服务端状态。abandoned 同时覆盖「失败」与「已放弃的死路」。 */
 export const STATUSES = Object.freeze(['open', 'active', 'done', 'abandoned']);
 
+/**
+ * 关闭原因（P1）：status 只表达生命周期，closeReason 解释「为什么结束」。
+ * solved=已解决；completed=流程正常结束；dead_end=研究走不通；superseded=被替代；
+ * duplicate=重复合并；curated=自动收敛；aborted=工具失败/中断；recorded=只是记录。
+ */
+export const CLOSE_REASONS = Object.freeze([
+    'solved',
+    'dead_end',
+    'superseded',
+    'duplicate',
+    'curated',
+    'aborted',
+    'recorded',
+    'completed',
+]);
+
+/** 关闭者：人工、系统自动、旧图迁移。 */
+export const RESOLUTION_BY = Object.freeze(['human', 'auto', 'migrated']);
+
+/** 合法 closeReason；空值归一为 null。 */
+export function normalizeCloseReason(value, fallback = null) {
+    if (value === null || value === undefined || value === '') return fallback;
+    return CLOSE_REASONS.includes(value) ? value : fallback;
+}
+
+/** 合法 resolutionBy；空值归一为 null。 */
+export function normalizeResolutionBy(value, fallback = null) {
+    if (value === null || value === undefined || value === '') return fallback;
+    return RESOLUTION_BY.includes(value) ? value : fallback;
+}
+
+/**
+ * 按 kind/status 给出默认结束原因。写入端（graph/extract/tools）共用，
+ * 避免「done 了但没有原因」再次造成口径漂移。
+ */
+export function defaultCloseReasonFor(kind, status) {
+    const normalized = normalizeStatus(status);
+    if (normalized === 'open' || normalized === 'active') return null;
+    if (kind === 'dead_end') return 'dead_end';
+    if (kind === 'evidence' || kind === 'note' || kind === 'conclusion' || kind === 'artifact') return 'recorded';
+    if (kind === 'decision') return normalized === 'done' ? 'recorded' : 'aborted';
+    if (kind === 'goal' || kind === 'topic') return normalized === 'done' ? 'solved' : 'aborted';
+    if (kind === 'step' || kind === 'action') return normalized === 'done' ? 'completed' : 'aborted';
+    if (kind === 'question' || kind === 'hypothesis') return normalized === 'done' ? 'solved' : 'aborted';
+    return null;
+}
+
 /** 跨分支关系（树关系只由 parentId 表达）。 */
 export const EDGE_KINDS = Object.freeze([
     'supports',

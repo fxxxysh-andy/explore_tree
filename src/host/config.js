@@ -38,6 +38,8 @@ export const DEFAULT_CONFIG = Object.freeze({
     injectBrief: true,
     /** 简报范围：workspace=含同工作区其他 goal 的主干（多 agent 默认）；goal=只看当前会话 goal。 */
     briefScope: 'workspace',
+    /** 单次注入的研究简报长度上限（字符；默认 1200，约 300 token）。 */
+    briefMaxChars: 1200,
     /** 自动提取忽略的工具名（本插件自身的读写工具不能反向污染图）。 */
     ignoreTools: ['explore_tree', 'explore_tree_record'],
     /** 首次打开旧图时，把「每次调用一个动作节点」的历史数据压缩成每轮汇总。 */
@@ -118,6 +120,16 @@ export const DEFAULT_CONFIG = Object.freeze({
         /** 轮末用 LLM 重写 topic digest（默认关，失败回退模板摘要）。 */
         digest: false,
     }),
+    /** 独立的研究图解析（概览页「AI 解析」按钮，手动触发，不属于自动提取链路）。 */
+    analysis: Object.freeze({
+        enabled: true,
+        provider: undefined,
+        model: undefined,
+        maxInputChars: 12000,
+        timeoutMs: 60000,
+        maxOutputTokens: 1600,
+        cacheTtlMs: 600000,
+    }),
 });
 
 function num(value, fallback, min, max) {
@@ -185,6 +197,7 @@ export function normalizeConfig(raw) {
     const input = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
     const extract = input.extract !== null && typeof input.extract === 'object' ? input.extract : {};
     const llm = input.llm !== null && typeof input.llm === 'object' ? input.llm : {};
+    const analysis = input.analysis !== null && typeof input.analysis === 'object' ? input.analysis : {};
     const merged = { ...DEFAULT_CONFIG, ...input };
     return {
         ...merged,
@@ -206,6 +219,7 @@ export function normalizeConfig(raw) {
         topicIntentThreshold: floatNum(extract.topicIntentThreshold ?? input.topicIntentThreshold, DEFAULT_CONFIG.topicIntentThreshold, 0, 1),
         injectBrief: bool(input.injectBrief ?? extract.injectBrief, DEFAULT_CONFIG.injectBrief),
         briefScope: briefScopeOf(input.briefScope ?? extract.briefScope),
+        briefMaxChars: num(input.briefMaxChars ?? extract.briefMaxChars, DEFAULT_CONFIG.briefMaxChars, 200, 4000),
         ignoreTools: stringList(extract.ignoreTools ?? input.ignoreTools, DEFAULT_CONFIG.ignoreTools),
         compactLegacyActions: bool(extract.compactLegacyActions ?? input.compactLegacyActions, DEFAULT_CONFIG.compactLegacyActions),
         repairOrphanSteps: bool(extract.repairOrphanSteps ?? input.repairOrphanSteps, DEFAULT_CONFIG.repairOrphanSteps),
@@ -245,6 +259,15 @@ export function normalizeConfig(raw) {
             timeoutMs: num(llm.timeoutMs, DEFAULT_CONFIG.llm.timeoutMs, 1000, 120000),
             maxOutputTokens: num(llm.maxOutputTokens, DEFAULT_CONFIG.llm.maxOutputTokens, 128, 8192),
             digest: bool(llm.digest, false),
+        },
+        analysis: {
+            enabled: bool(analysis.enabled, DEFAULT_CONFIG.analysis.enabled),
+            provider: nonEmptyString(analysis.provider),
+            model: nonEmptyString(analysis.model),
+            maxInputChars: num(analysis.maxInputChars, DEFAULT_CONFIG.analysis.maxInputChars, 2000, 40000),
+            timeoutMs: num(analysis.timeoutMs, DEFAULT_CONFIG.analysis.timeoutMs, 5000, 180000),
+            maxOutputTokens: num(analysis.maxOutputTokens, DEFAULT_CONFIG.analysis.maxOutputTokens, 256, 4000),
+            cacheTtlMs: num(analysis.cacheTtlMs, DEFAULT_CONFIG.analysis.cacheTtlMs, 0, 3600000),
         },
     };
 }

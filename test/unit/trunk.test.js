@@ -10,6 +10,7 @@ import {
     digestBasisOf,
     leafRootImportance,
     leaseStatus,
+    briefMaxCharsOf,
     renderBrief,
     renderBriefDelta,
     snapshotBriefState,
@@ -133,7 +134,7 @@ test('refreshAncestorTopics 会向上刷新父 topic', () => {
     assert.equal(state.nodes.get(goal.id).digest, null);
 });
 
-test('trunkFrontier/renderBrief：给出主干建议与 ≤400 字简报', () => {
+test('trunkFrontier/renderBrief：给出主干建议与 ≤1200 字简报', () => {
     const { state, topic, leaf } = setup();
     refreshTopicDigest(state, topic.id);
     const items = trunkFrontier(state, { limit: 5 });
@@ -144,7 +145,7 @@ test('trunkFrontier/renderBrief：给出主干建议与 ≤400 字简报', () =>
     assert.match(brief, /研究轨迹简报/);
     assert.match(brief, /主干/);
     assert.match(brief, /建树算法/);
-    assert.ok(brief.length <= 400, `brief 应 ≤400 字，实际 ${brief.length}`);
+    assert.ok(brief.length <= 1200, `brief 应 ≤1200 字，实际 ${brief.length}`);
     assert.equal(leaf.status, 'open');
 });
 
@@ -164,7 +165,47 @@ test('renderBriefDelta：只报关键节点变化，忽略 step/action 与无变
     assert.match(delta, /完成：/);
     assert.doesNotMatch(delta, /第 2 轮/, 'step 完成不算研究增量');
     assert.doesNotMatch(delta, /【研究轨迹简报】/);
-    assert.ok(delta.length <= 400, '增量应 ≤400 字');
+    assert.ok(delta.length <= 1200, '增量应 ≤1200 字');
+});
+
+test('renderBrief：默认 1200 字符预算，maxChars 在分句边界截断', () => {
+    const { state, topic } = setup();
+    refreshTopicDigest(state, topic.id);
+    assert.equal(briefMaxCharsOf(undefined), 1200);
+    assert.equal(briefMaxCharsOf(1), 200);
+    assert.equal(briefMaxCharsOf(99999), 4000);
+    const brief = renderBrief(state, { maxChars: 240 });
+    assert.ok(brief.length <= 240, `brief 应 ≤240 字，实际 ${brief.length}`);
+    assert.match(brief, /…$/);
+    assert.match(brief, /研究轨迹简报/);
+});
+
+test('renderBriefDelta：默认最多 1200 字符，包含计数、摘要与下一步', () => {
+    const { state, leaf } = setup();
+    const before = snapshotBriefState(state);
+    for (let index = 0; index < 8; index += 1) {
+        addNode(state, {
+            kind: 'conclusion',
+            parentId: leaf.id,
+            title: `结论 ${index}：${'缓存键随版本变化'.repeat(3)}`,
+            summary: '先回滚键格式，再观察一周命中率；同时补一条回归测试。',
+            status: 'done',
+            now: NOW,
+        });
+    }
+    updateNode(state, leaf.id, { status: 'done' }, { now: NOW });
+    const delta = renderBriefDelta(state, before);
+    assert.match(delta, /研究轨迹增量/);
+    assert.match(delta, /待办 \d+（本会话）|待办 \d+/);
+    assert.match(delta, /进行中 \d+ · 死路 \d+/);
+    assert.match(delta, /先回滚键格式/);
+    assert.match(delta, /下一步：/);
+    assert.ok(delta.length <= 1200, `增量应 ≤1200 字，实际 ${delta.length}`);
+    assert.ok(delta.length > 400, `默认预算应能超过旧 400 字上限，实际 ${delta.length}`);
+
+    const capped = renderBriefDelta(state, before, { maxChars: 300 });
+    assert.ok(capped.length <= 300, `capped 应 ≤300 字，实际 ${capped.length}`);
+    assert.match(capped, /…$/);
 });
 
 test('renderBriefDelta：首次没有快照时退回完整简报', () => {
@@ -240,5 +281,5 @@ test('renderBrief：workspace 范围显示其他 goal 的主干，goal 范围不
     assert.match(workspaceBrief, /其他主干：/);
     assert.match(workspaceBrief, /共享黑板/);
     assert.match(workspaceBrief, /认领 \+ handoff/);
-    assert.ok(workspaceBrief.length <= 400, `brief 应 ≤400 字，实际 ${workspaceBrief.length}`);
+    assert.ok(workspaceBrief.length <= 1200, `brief 应 ≤1200 字，实际 ${workspaceBrief.length}`);
 });

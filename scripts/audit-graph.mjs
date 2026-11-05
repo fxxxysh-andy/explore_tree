@@ -10,12 +10,14 @@
  *   - step 标题被注入消息污染；
  *   - 同一 session+turn 出现多个 step（旧图重复）；
  *   - 父节点悬空；
- *   - topic（摘要主干）父节点不是 goal/topic、子节点不是 topic/叶根、缺 digest。
+ *   - topic（摘要主干）父节点不是 goal/topic、子节点不是 topic/叶根、缺 digest；
+ *   - v2 图的关闭节点缺 closeReason/resolutionBy，或开放节点仍带结束原因。
  * WARN：
  *   - edges = 0（v0.8 起应有跨轮 continues 边）；
  *   - note 占全部节点 > 30%（旧图的过程旁白）；
  *   - 最大深度 < 3（树没有真正分层）；
- *   - 叶根不在 topic 下、语义节点仍挂在 step 下、主干宽度/深度/摘要长度超限。
+ *   - 叶根不在 topic 下、语义节点仍挂在 step 下、主干宽度/深度/摘要长度超限；
+ *   - v1 图尚未回填 closeReason/resolutionBy。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -36,6 +38,8 @@ const SEMANTIC_KINDS = ['question', 'hypothesis', 'evidence', 'decision', 'dead_
 const TRUNK_MAX_WIDTH = 9;
 const TRUNK_MAX_DEPTH = 4;
 const DIGEST_MAX = 120;
+const CLOSE_REASONS = ['solved', 'dead_end', 'superseded', 'duplicate', 'curated', 'aborted', 'recorded', 'completed'];
+const RESOLUTION_BY = ['human', 'auto', 'migrated'];
 
 function parseArgs(argv) {
     const options = { workspace: process.cwd(), json: false, fail: true };
@@ -140,6 +144,31 @@ if (dangling.length > 0) {
     failures.push(`父节点悬空 ${dangling.length} 个：${dangling.slice(0, 8).map((node) => node.id).join(', ')}${dangling.length > 8 ? ' …' : ''}`);
 }
 
+// ── 结束原因（P2）──
+const graphVersion = Number(graph.version ?? 1);
+const closedNodes = nodes.filter((node) => node.status === 'done' || node.status === 'abandoned');
+const byCloseReason = {};
+const byResolution = {};
+for (const node of nodes) {
+    if (CLOSE_REASONS.includes(node.closeReason)) byCloseReason[node.closeReason] = (byCloseReason[node.closeReason] ?? 0) + 1;
+    if (RESOLUTION_BY.includes(node.resolutionBy)) byResolution[node.resolutionBy] = (byResolution[node.resolutionBy] ?? 0) + 1;
+}
+if (graphVersion >= 2) {
+    const missingReason = closedNodes.filter((node) => !CLOSE_REASONS.includes(node.closeReason)
+        || !RESOLUTION_BY.includes(node.resolutionBy));
+    if (missingReason.length > 0) {
+        failures.push(`v2 关闭节点缺少合法 closeReason/resolutionBy ${missingReason.length} 个：${missingReason.slice(0, 8).map((node) => node.id).join(', ')}${missingReason.length > 8 ? ' …' : ''}`);
+    }
+    const openWithReason = nodes.filter((node) => (node.status === 'open' || node.status === 'active')
+        && (node.closeReason !== null && node.closeReason !== undefined
+            || (node.resolutionBy !== null && node.resolutionBy !== undefined)));
+    if (openWithReason.length > 0) {
+        failures.push(`开放节点仍带结束原因 ${openWithReason.length} 个：${openWithReason.slice(0, 8).map((node) => node.id).join(', ')}${openWithReason.length > 8 ? ' …' : ''}`);
+    }
+} else {
+    warnings.push(`graph.version=${graph.version ?? '?'}：尚未回填 closeReason/resolutionBy（运行 npm run migrate-close-reason -- --apply）`);
+}
+
 const thoughts = nodes.filter((node) => THOUGHT_KINDS.includes(node.kind));
 const noteRatio = thoughts.length === 0 ? 0 : (byKind.note ?? 0) / thoughts.length;
 if (edges.length === 0) warnings.push('edges = 0：v0.8 起同会话每轮应与上一轮建 continues 边；旧图不回溯补边，重启宿主后新事件才生成');
@@ -199,6 +228,7 @@ if (semanticUnderStep.length > 0) {
 const summary = {
     workspace: options.workspace,
     file,
+    version: graph.version ?? null,
     nodes: nodes.length,
     edges: edges.length,
     sessions: Object.keys(graph.sessions ?? {}).length,
@@ -207,6 +237,8 @@ const summary = {
     topics: topics.length,
     byKind,
     byStatus,
+    byCloseReason,
+    byResolution,
     noteRatio: Math.round(noteRatio * 1000) / 10,
     failures,
     warnings,
@@ -220,6 +252,9 @@ if (options.json) {
     console.log(`节点 ${summary.nodes} · 边 ${summary.edges} · 会话 ${summary.sessions} · 根 ${summary.roots} · 主干 ${summary.topics} · 最大深度 ${summary.maxDepth}`);
     console.log(`kinds  ${Object.entries(byKind).map(([kind, count]) => `${kind}:${count}`).join(' ')}`);
     console.log(`status ${Object.entries(byStatus).map(([status, count]) => `${status}:${count}`).join(' ')}`);
+    if (Object.keys(byCloseReason).length > 0) {
+        console.log(`close  ${Object.entries(byCloseReason).map(([reason, count]) => `${reason}:${count}`).join(' ')} · by ${Object.entries(byResolution).map(([by, count]) => `${by}:${count}`).join(' ')}`);
+    }
     for (const failure of failures) console.log(`FAIL  ${failure}`);
     for (const warning of warnings) console.log(`WARN  ${warning}`);
     console.log(failures.length === 0 ? '结论：PASS' : '结论：FAIL');

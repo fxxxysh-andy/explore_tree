@@ -416,7 +416,7 @@ test('toolCallMode=nodes 时保留逐调用节点（旧行为可切回）', asyn
     assert.equal(actions[0].hits, 2);
 });
 
-test('工具失败记录 abandoned 动作与 dead_end', async (t) => {
+test('工具失败记录 abandoned 动作，错误聚合进轮次摘要（不再逐条建 dead_end）', async (t) => {
     const { store, extractor } = setup(t);
     await extractor.handle({ type: 'user.message', sessionId: SESSION, text: '尝试一个会失败的命令' });
     await extractor.handle({ type: 'turn.start', sessionId: SESSION, turn: 1 });
@@ -425,11 +425,12 @@ test('工具失败记录 abandoned 动作与 dead_end', async (t) => {
     await extractor.handle({ type: 'turn.end', sessionId: SESSION, turn: 1, aborted: true, error: 'command not found' });
     const state = store.state;
     const action = [...state.nodes.values()].find((node) => node.kind === 'action');
-    const deadEnd = [...state.nodes.values()].find((node) => node.kind === 'dead_end');
+    const deadEnds = [...state.nodes.values()].filter((node) => node.kind === 'dead_end');
     const step = [...state.nodes.values()].find((node) => node.kind === 'step');
     assert.equal(action.status, 'abandoned');
-    assert.equal(deadEnd.parentId, step.id, '失败直接挂在 step 下，避免动作节点套娃');
-    assert.match(deadEnd.summary, /command not found/);
+    assert.equal(deadEnds.length, 0, '工具失败不再逐条建 dead_end');
+    assert.match(step.summary, /工具失败 ×1/);
+    assert.match(step.summary, /command not found/);
 });
 
 test('插件自身工具不记录；轮次中断标 abandoned', async (t) => {
@@ -1030,7 +1031,7 @@ test('ranked：本轮新建节点落选时仍删除并回退预算（保留增�
     assert.equal([...store.state.nodes.values()].filter((node) => node.kind === 'hypothesis').length, 1);
 });
 
-test('工具聚合路径共享 maxAutoNodesPerTurn：聚合动作、失败 dead_end、轮末中断都占预算（回归）', async (t) => {
+test('工具失败只占聚合动作一个节点，不再逐条建 dead_end 或轮末中断节点（回归）', async (t) => {
     const warnings = [];
     const { store, extractor } = setupWithConfig(t, { maxAutoNodesPerTurn: 2 }, {
         warn: (message) => warnings.push(String(message)),
@@ -1051,22 +1052,24 @@ test('工具聚合路径共享 maxAutoNodesPerTurn：聚合动作、失败 dead_
     const deadEnds = nodes.filter((node) => node.kind === 'dead_end');
     const runtime = extractor.runtime.get(SESSION);
     assert.equal(actions.length, 1, '聚合动作节点只建一个');
-    assert.equal(deadEnds.length, 1, '预算用尽后失败 dead_end 与轮末中断 dead_end 都应跳过');
-    assert.equal(runtime.autoCount, 2, 'autoCount 只记两个占预算的新节点（goal/step 不占）');
+    assert.equal(deadEnds.length, 0, '失败与轮末中断都不再建 dead_end');
+    assert.equal(runtime.autoCount, 1, 'autoCount 只记聚合动作（goal/step 不占，失败也不占）');
     assert.equal(nodes.filter((node) => node.kind === 'goal').length, 1);
     assert.equal(nodes.filter((node) => node.kind === 'step').length, 1);
     assert.match(actions[0].title, /工具调用 ×6/, '聚合计数轮末仍定稿');
-    assert.equal(warnings.filter((message) => message.includes('上限 2')).length, 1, '预算耗尽只记一次日志');
+    assert.match(nodes.find((node) => node.kind === 'step').summary, /工具失败 ×6/);
+    assert.equal(warnings.length, 0, '失败不再占预算，不会触发上限日志');
 
-    // 下一轮：预算与告警都应重置，每轮最多再记一条超限日志。
+    // 下一轮：预算与失败聚合都应重置。
     await emit({ type: 'turn.start', turn: 2 });
     for (let index = 0; index < 3; index += 1) {
         const callId = `t2-${index}`;
         await emit({ type: 'tool.start', turn: 2, callId, toolName: 'bash', args: { command: `again ${index}` } });
         await emit({ type: 'tool.end', turn: 2, callId, toolName: 'bash', ok: false, error: `第二轮错误 ${index}` });
     }
-    assert.equal(warnings.filter((message) => message.includes('第 2 轮')).length, 1, '新的一轮应重新允许一条超限日志');
-    assert.equal(warnings.filter((message) => message.includes('上限 2')).length, 2, '两轮各记一条，不会跨轮吞掉');
+    assert.equal(warnings.length, 0);
+    assert.equal([...store.state.nodes.values()].filter((node) => node.kind === 'action').length, 2, '下一轮重建一个聚合动作');
+    assert.equal([...store.state.nodes.values()].filter((node) => node.kind === 'dead_end').length, 0);
 });
 
 test('重复 turn.start 不重置轮级预算；user.message 先到的新轮 turn.start 仍会重置（回归）', async (t) => {
@@ -1086,13 +1089,12 @@ test('重复 turn.start 不重置轮级预算；user.message 先到的新轮 tur
     const runtime = extractor.runtime.get(SESSION);
     assert.equal(runtime.autoCount, 1, '聚合 action 应刚好用满预算 1');
 
-    // 重复投递同一轮的 turn.start：不得清空预算/告警/claim 状态。
+    // 重复投递同一轮的 turn.start：不得清空预算/claim 状态。
     await emit({ type: 'turn.start', turn: 1 });
     assert.equal(runtime.autoCount, 1, '重复 turn.start 不应重置预算');
     await failTool(1, 'c2', '第一轮第二个错误');
     assert.equal(runtime.autoCount, 1, '同一轮预算仍应保持满额');
     assert.equal([...store.state.nodes.values()].filter((node) => node.kind === 'action').length, 1, '重复轮内不再新建 action');
-    assert.equal(warnings.filter((message) => message.includes('上限 1')).length, 1, '同一轮超限仍只记一次');
 
     // 宿主顺序：user.message 先把 runtime.turn 抬到 2，随后才到 turn.start 2。
     // 不能因为 runtime.turn 已经等于 2 就跳过轮级重置。
@@ -1113,8 +1115,7 @@ test('重复 turn.start 不重置轮级预算；user.message 先到的新轮 tur
     const nodes = [...store.state.nodes.values()];
     assert.equal(nodes.filter((node) => node.kind === 'step').length, 2, '每轮一个 step');
     assert.equal(nodes.filter((node) => node.kind === 'action').length, 2, '两轮各一个聚合 action');
-    assert.equal(nodes.filter((node) => node.kind === 'dead_end').length, 0, '预算 1 时失败 dead_end 均跳过');
-    assert.equal(warnings.filter((message) => message.includes('上限 1')).length, 2, '两轮各记一条超限日志');
+    assert.equal(nodes.filter((node) => node.kind === 'dead_end').length, 0, '工具失败不再建 dead_end');
 });
 
 test('artifact/deliverable 也占自动节点预算：重复指纹只加 hits（回归）', async (t) => {

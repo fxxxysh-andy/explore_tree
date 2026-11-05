@@ -11,7 +11,14 @@
 - 工作区共享：同一 workspace 下所有会话/子代理共用一棵树，落盘 `.explore-tree/`。
 - 零构建：宿主侧纯 ESM JS，浏览器侧手写 `__ModuleLoader__` bundle。
 
-设计契约见 [`docs/design.md`](docs/design.md)。
+设计契约见 [`docs/design.md`](docs/design.md)，树结构审计与改进建议见
+[`docs/tree-review.md`](docs/tree-review.md)；结构改造研究（摘要主干 + 叶节点、长期研究与多 agent）见
+[`docs/tree-structure-research.md`](docs/tree-structure-research.md)，多 agent 同树协作的现状审计与 P5 设计见
+[`docs/multi-agent-collaboration.md`](docs/multi-agent-collaboration.md)，
+三模型并发控制的实证报告见 [`docs/multi-agent-experiment.md`](docs/multi-agent-experiment.md)，H4 单 agent 对照的预注册协议见 [`docs/h4-ab-protocol.md`](docs/h4-ab-protocol.md)；DSH 宿主/客户端 API 调研见
+[`docs/research/host-api.md`](docs/research/host-api.md)、
+[`docs/research/client-api.md`](docs/research/client-api.md) 与
+[`docs/research/packaging.md`](docs/research/packaging.md)。
 
 ---
 
@@ -56,7 +63,7 @@ node scripts/uninstall.mjs --profile web     # 会先备份再移除
 ### 方式 B：手工安装
 
 ```powershell
-dsh plugin --profile web add link:C:/path/to/explore-tree
+dsh plugin --profile web add link:D:/yky/code/explore-tree
 ```
 
 并在该 profile 的 `cordis.patch.yml` 中加入本包的 [`cordis.patch.yml`](cordis.patch.yml)
@@ -74,18 +81,18 @@ dsh plugin --profile web add link:C:/path/to/explore-tree
 
 ```jsonc
 explore_tree({ "action": "overview" })
-// → { ok, action: "overview", text: "……目标/焦点/最近/未决/死路/建议……" }
+// → { ok, action: "overview", text: "……目标/焦点/最近/待办/死路/建议……" }
 ```
 
 | action | 作用 |
 |---|---|
-| `overview` | 目标、焦点、最近节点、未决问题（自动旁白/旧主题/推理细节只折叠计数）、死路、产物、结论（默认；只汇总**当前会话**的节点） |
+| `overview` | 目标、焦点、最近节点、待办（自动旁白/旧主题/推理细节只折叠计数）、死路、产物、结论（默认；只汇总**当前会话**的节点） |
 | `trunk` | 摘要主干：goal → topic → 叶根，带 digest、进度、owner（交流/交接用） |
-| `brief` | ≤400 字研究简报：目标 / 主干 digest / 其他主干 / 未决叶根 / 下一步（轮首或压缩后读；宿主注入时首次完整、后续只推增量） |
+| `brief` | ≤1200 字研究简报（约 300 token）：目标 / 主干 digest / 其他主干 / 待办叶根 / 下一步（轮首或压缩后读；宿主注入时首次完整、后续只推增量） |
 | `frontier` | 下一步建议（含「验证/收敛」与「换轨」两类）+ `avoid` |
-| `walk` | 沿当前分支展开：路径/父级/兄弟/子节点/未决叶/缺口/下一步，附按 kind 的 add 模板；焦点用 `id`/`focus`，省略用会话游标 |
+| `walk` | 沿当前分支展开：路径/父级/兄弟/子节点/待办叶/缺口/下一步，附按 kind 的 add 模板；焦点用 `id`/`focus`，省略用会话游标 |
 | `team` | 与 Agent Teams 协作：树侧我的主题/未认领/租约过期/冲突，加上真实 Team 成员与任务（按 `description` 的 `[explore-tree:n12]` 标记挂回节点）；`actor` 过滤个人队列 |
-| `stats` | 节点/边/状态/重复劳动统计；含 per-actor 的创建者/最近更新者分布 |
+| `stats` | 节点/边/语义状态/重复劳动统计；含 per-actor 的创建者/最近更新者分布；原始 byStatus 保留供调试 |
 | `find` | 按关键词搜标题/摘要/digest/标签/引用（标题与 digest 命中优先；摘要命中会附片段） |
 | `node` | 单节点详情（摘要、引用、子节点、旁支） |
 | `path` | 到根的路径 |
@@ -114,7 +121,8 @@ explore_tree_record({
 ```
 
 支持的 kind：`goal topic question hypothesis step action evidence decision dead_end conclusion artifact note`；
-状态：`open active done abandoned`；旁支关系：`supports contradicts refines depends replaces duplicates continues related`。
+状态：`open active done abandoned`；关闭原因：`solved completed dead_end superseded duplicate curated aborted recorded`；
+结束者：`human auto migrated`；旁支关系：`supports contradicts refines depends replaces duplicates continues related`。
 
 ### 3.1.1 摘要主干与叶节点（v0.13）
 
@@ -127,7 +135,7 @@ explore_tree_record({ "action": "add", "parentId": "n12", "kind": "question", "t
 ```
 
 - `explore_tree({ "action": "trunk" })`：只看主干（goal → topic → 叶根，带 digest 与进度）；
-- `explore_tree({ "action": "brief" })`：≤400 字简报（目标/主干/其他主干/未决/下一步），轮首或压缩后读；`scope=goal` 可退回只看当前 goal；宿主注入时首次完整，之后只推增量，无变化跳过；
+- `explore_tree({ "action": "brief" })`：≤1200 字简报（约 300 token；目标/主干/其他主干/待办/下一步），轮首或压缩后读；`scope=goal` 可退回只看当前 goal；宿主注入时首次完整，之后只推增量，无变化跳过；字符预算可用 `briefMaxChars` 调（200–4000）；
 - `record promote`：把叶根提升为 topic；`assign`：认领 owner/租约（多 agent）；`handoff`：转移租约并写交接包；`digest`：人工修订摘要；
 - topic 的 `digest` 由子节点标题/摘要/状态**模板合成**（≤120 字，不读原文，不调模型）；
 - **归档**：`record archive {id}` 把完成叶根标 `archived` + `done`，主干视图与 `trunk` 默认隐藏；
@@ -146,14 +154,33 @@ explore_tree_record({ "action": "add", "parentId": "n12", "kind": "question", "t
   另起候选主题，避免新问题永久留在 step 下。候选主题可在面板改名/合并，或由 `promote` 转正。
 - 面板顶部新增「主干 / 研究」切换：主干只画 goal/topic/叶根，研究画全部节点。
 
-### 3.1.2 沿树展开与 Agent Teams 协作（v0.25/v0.26）
+主干视图：目标 → 3 个主题 → 叶根，卡片带 digest、主题进度与 owner。
+
+### 3.1.2 状态口径（P0/P1/P2）
+
+图里仍只存 `open active done abandoned` 四个原始状态（兼容旧数据），但所有展示面（`overview` / 面板 / `brief` / `trunk` / `frontier`）统一走 `src/core/status.js` 的 `statusDigest()`，派生为六个主桶：
+
+| 主桶 | 包含 | 含义 |
+|---|---|---|
+| `待办` | question/hypothesis/decision 的 open/active | 需要人推进的研究结论；自动旁白/旧主题/推理细节只折叠计数。`强` = 人工写入、blocker、有细节子节点或重复命中 |
+| `进行中` | goal/topic/step/action 的 open/active | 结构/流程仍在展开，不再混进待办 |
+| `已记录` | evidence/note/conclusion/artifact，以及 done 的 decision | 产出与依据，不代表任务完成 |
+| `流程完成` | done 的 step/action | 时间桶/动作结束 |
+| `已关闭` | done 的 goal/topic，以及 P1 显式 `solved` 的 question/hypothesis | 目标/主题/问题真正关闭 |
+| `真死路` | 非工具失败、非合并、非自动收敛的 dead_end，或显式 `dead_end` 的 question/hypothesis | 研究方向走不通，进 `frontier.avoid` |
+
+尾桶（折叠显示）：`自动收敛`（auto-curated 的 question/hypothesis）、`已合并`、`工具失败`、`中断`。`stats` 仍输出原始 `byStatus` 供调试；UI 主数字统一为「待办 · 可见数 · 范围（本会话/全图）」，并显示强/自动/折叠。
+
+P1（v0.28）起，**写入端**在关闭时同时记录 `closeReason`（`solved` / `completed` / `dead_end` / `superseded` / `duplicate` / `curated` / `aborted` / `recorded`）与 `resolutionBy`（`human` / `auto` / `migrated`）。`close` 问题/假设必须显式给 `solved` 或 `dead_end`；其他 kind 省略时按类型取默认（goal/topic→solved，step/action→completed，记录类→recorded，dead_end→dead_end）。`reopen` 会清空这两个字段；`merge` 默认写 `duplicate`，也可指定 `superseded`。旧图缺失字段时仍由 `inferCloseReason` 按 kind/status/标签兜底。P2（v0.29）新增 `npm run migrate-close-reason`：dry-run 看计数，`--apply` 备份并原子写，`--revert --apply` 只清 `resolutionBy=migrated`；`graph.version` 从 1 升到 2，旧 v1 仍可读。字段与迁移细节见 [docs/schema.md](docs/schema.md)。
+
+### 3.1.3 沿树展开与 Agent Teams 协作（v0.25/v0.26）
 
 `walk` 把「当前该往哪走」收敛到当前分支，而不是每次从全图重新挑旧节点：
 
 ```jsonc
 // 沿当前会话焦点走；也可以 id=n2027 / focus=n2027 指定起点
 explore_tree({ "action": "walk" })
-// → 路径、子节点、未决叶、缺口、下一步 descend/expand/branch/resume，
+// → 路径、子节点、待办叶、缺口、下一步 descend/expand/branch/resume，
 //   expand 附 explore_tree_record add 模板
 ```
 
@@ -176,7 +203,7 @@ explore_tree({ "action": "team", "actor": "agent-a" })
 
 ### 3.2 使用约定（系统提示里也是这段的静态版）
 
-1. **先看再动**：开新方向前 `explore_tree overview`；接续长期研究先 `trunk`/`brief`，确认已有目标/主干/未决叶根。
+1. **先看再动**：开新方向前 `explore_tree overview`；接续长期研究先 `trunk`/`brief`，确认已有目标/主干/待办叶根。
 2. **走错路也有价值**：失败记 `dead_end` 并写原因；`frontier` 会避开，有新证据才建议 `reopen`。
 3. **多路径 ≠ 瞎换**：`frontier` 同时给验证/收敛与换轨建议；优先做能证伪当前假设的最小实验。
 4. **落节点要短**：标题一句话，摘要写理由、证据与引用。
@@ -187,30 +214,38 @@ explore_tree({ "action": "team", "actor": "agent-a" })
 安装并刷新页面后，会话上栏的页签行里会出现「研究轨迹」（`conversation.view`，`order=45`，排在记忆(40)与预览(50)之间）。**不需要选择工作区**：
 
 - 页签自动使用当前会话的工作区（读 `session.cwd`）；同一 workspace 的所有会话/子代理共享同一张图。
-- 顶部工具栏保留画布操作，显示/过滤偏好集中在「设置 → 研究轨迹」：
-  - 第一行：标题、当前工作区名、节点/想法/未决/关系/层深统计，以及 `主干`/`研究`、`折叠` `展开` `适应宽度` `最新`、缩放组（`−` 百分比 `+`，20%–160%）、`刷新`；右侧提示「显示选项在 设置 → 研究轨迹」。
-  - 第二行：搜索框（标题/摘要/标签，回车跳到下一个匹配）、按轮次定位的 chips（`第 N 轮 · 子节点数`）。
-  - 第三行：按 kind 的图例计数，点击只看某一类，再点取消。
-- 设置页新增「研究轨迹」分区（`settings.section`，id `explore-tree`，order 518）：
-  显示组含 `自动刷新` `紧凑模式` `大纲` `详情栏`，过滤组含 `隐藏动作` `隐藏产物` `隐藏笔记` `只看未决` `仅本会话`；
+- 页签顶部是粘性 hero：品牌、实时同步脉搏、当前工作区；研究树页另显示节点/想法/待办/关系 4 个 KPI，
+  以及 14 天 sparkline、`刷新`、`右侧栏` 按钮。
+- 页签分「概览 / 研究树」两页（v0.30）：
+  - **概览**（只读仪表盘）：4 张 KPI 卡；**研究脉搏**（7/30/90 天，每日新增柱 + 累计面积折线，悬停出数值）；
+    **阶段构成**（环形图 + 完成率进度条）；**活跃热力**（近 8 周，含峰值日/活跃日/连续天）；
+    **节点类型**（占比堆叠条 + 百分比条形，点击只看该类型并跳到研究树）；**最近动态**（6 条，点击定位）；
+    **待办焦点**、**下一步建议**（frontier）与**记录口径**；KPI 之后是 **AI 解析**面板（v0.31，手动触发、
+    结果可缓存，引用节点可点击定位）。
+  - **研究树**：保留原卡片树，工具栏收成三行——①搜索 + `主干`/`研究` + `折叠` `展开` `适应宽度` `最新` + 缩放组；
+    ②轮次 chips 与「显示选项在 设置 → 研究轨迹」；③按 kind 的图例计数。刷新后新增节点带 12 秒脉冲光晕。
+- 设置页新增「研究轨迹」分区（`settings.section`，id `explore-tree`，order 518）：卡片式两列布局，
+  显示组含 `自动刷新` `紧凑模式` `大纲` `详情栏` `显示 AI 解析`，过滤组含 `隐藏动作` `隐藏产物` `隐藏笔记` `只看待办` `仅本会话`；
+  另有「AI 解析」全宽卡显示模型路由与 `maxInputChars` 预算；开关改为滑动 switch；
   偏好存 `localStorage`（`explore-tree.prefs.v1`），面板与设置页实时同步，另有「恢复默认」。
 - 画布左侧是**大纲**（目标 + 每轮标题与子树计数，点击直接定位），可在设置页关闭。
-- 画布是自上而下的**卡片树**（父卡在上、子卡在下，贝塞尔连线，选中路径高亮；卡片含类型徽标、标题、摘要、状态、子树统计与折叠按钮）。布局按「打包行」放置：同一父节点的子卡超过一行宽度时自动换行堆叠，父卡居中于子块，多个根纵向堆叠，避免宽树被拉成几屏宽；首次加载或点 `适应宽度` 时按画布宽自动缩放，手动缩放后不再自动改。
-- 卡片 meta 只留 id 与命中次数，底部一行是状态、**子树聚合**（`子树 12 · 假设 3 证据 2`）与折叠按钮；摘要收为 1 行、卡片 262×128，设置页的 `紧凑模式` 用更小卡片换一屏信息量。
+- 画布是自上而下的**卡片树**（父卡在上、子卡在下，贝塞尔连线，选中路径高亮；卡片含类型徽标、标题、摘要、语义阶段（phase）、子树统计与折叠按钮）。布局按「打包行」放置：同一父节点的子卡超过一行宽度时自动换行堆叠，父卡居中于子块，多个根纵向堆叠，避免宽树被拉成几屏宽；首次加载或点 `适应宽度` 时按画布宽自动缩放，手动缩放后不再自动改。
+- 卡片 meta 只留 id 与命中次数，底部一行是语义阶段、**子树聚合**（`子树 12 · 假设 3 证据 2`）与折叠按钮；摘要收为 1 行、卡片 262×128，设置页的 `紧凑模式` 用更小卡片换一屏信息量。
 - 画布顶部有「主干 / 研究」切换；主干模式下左栏大纲同步变为主干树（goal → topic → 叶根）。
 - 详情栏的长摘要默认折叠成「摘要 + `展开全文 · N 字`」，旧 step 的原始 reasoning 不再撑满侧栏；LLM 辅助产生的节点带 `AI` 标记。
+  详情栏卡片底部重排，长摘要默认折叠成「摘要 + 展开全文 · N 字」。
 - 画布固定高度：滚轮纵向滚动、按住卡片/空白拖动平移、`Ctrl/⌘ + 滚轮` 以指针为中心缩放、`Shift + 滚轮` 横向滚动、双击空白适应宽度；工具栏缩放围绕视口中心、`适应宽度` 回到左上角，缩放与选中定位都不会带动整页滚动。
-- 右侧详情栏可收起：选中时显示摘要（长摘要折叠 + 展开）、标签、引用、**关系**（可点击跳转到对端）、可点击的根路径与子节点；无选中时显示图概况（统计、类型分布、未决、根节点）。收起后可在设置页重新打开。`frontier` 建议与 `avoid` 死路在右栏底部折叠显示。
+- 右侧详情栏可收起：选中时显示摘要（长摘要折叠 + 展开）、标签、引用、**关系**（可点击跳转到对端）、可点击的根路径与子节点；无选中时显示图概况（统计、类型分布、待办、根节点）。收起后可在设置页重新打开。`frontier` 建议与 `avoid` 死路在右栏底部折叠显示。
 - 首次渲染先显示「正在读取研究图…」，数据就绪后绘图；3s 轮询保留缩放、选中与折叠状态。
 - **右侧栏预览**（v0.26，`sidebar.right.pane.tab`，tab id `research-tree`）：宿主装有右侧栏插件时，
-  右栏新增「研究轨迹」页签，显示当前会话的目标、节点/未决/关系计数、可见未决前 3 项（点开摘要）
+  右栏新增「研究轨迹」页签，显示当前会话的目标、节点/待办/关系计数、可见待办前 3 项（点开摘要）
   与第一条下一步建议；完整画布仍在会话上方的「研究轨迹」页签。缺少右侧栏插件时该预览不注册，
   主面板与设置页不受影响。
-- 入口（v0.26.1）：第一次在某个会话打开「研究轨迹」页时自动展开右侧栏预览；关掉后可用面板
-  工具栏「右侧栏」按钮重开（调用 `sidebarRight.openTab('research-tree')`）。宿主没有
-  `openTab` 时按钮禁用，tab 类型仍正常注册。v0.26.2 起页签/body 与导航服务分开注入，
-  导航晚到会补开一次；body 先注册，旧 bundle 占用 tab id 时页签也不会空白。
-v0.26.3 起 guide 条目的 `title`/`description` 按宿主契约写成函数；写成字符串会让整个「开始」
+- 入口（v0.26.1，v0.27 起不再自动展开）：点击面板工具栏「右侧栏」按钮显式打开右侧栏预览
+  （调用 `sidebarRight.openTab('research-tree')`）；进入「研究轨迹」页签本身不会弹右栏。
+  宿主没有 `openTab` 时按钮禁用，tab 类型仍正常注册。v0.26.2 起页签/body 与导航服务分开注入，
+  body 先注册，旧 bundle 占用 tab id 时页签也不会空白。
+   v0.26.3 起 guide 条目的 `title`/`description` 按宿主契约写成函数；写成字符串会让整个「开始」
   页抛 `TypeError: entry.title is not a function`（v0.26.0–v0.26.2 的 bug，已修）。
 - 设置页的偏好（`explore-tree.prefs.v1`）同时作用于主面板与右侧栏预览；右栏按会话持久化。
 
@@ -220,15 +255,48 @@ v0.26.3 起 guide 条目的 `title`/`description` 按宿主契约写成函数；
 无会话时（刚重启还没有对话）没有页签入口，这是 `conversation.view` 的固有作用域；
 需要查看某个工作区的图时，在该工作区开会话即可。
 
+概览页用真实快照静态渲染，包含 KPI、研究脉搏、阶段构成、活跃热力、节点类型、最近动态与下一步建议。
+
+同一份 253 节点快照的对比：旧版只有刷新/隐藏动作/自动刷新；新版支持缩放、搜索、类型过滤、轮次定位与可收起详情。
+
+「仅本会话」过滤后可在面板查看该会话的案例树。
+
+实际案例：一个独立的 AI 会话只靠本插件的工具排障并修复 LRU 缓存 bug，记录了 4 层研究树。
+
+### 3.4 大模型解析研究轨迹（v0.31）
+
+概览页新增只读的「AI 解析」面板：用宿主已注册的 LLM 路由把当前图压成一份研究摘要，
+输出进展/阻塞/风险/洞察与下一步建议。**只有点击「开始解析」才会调用模型**；打开页签只探测配置与缓存。
+面板输出会区分进展、阻塞、风险与洞察，并给出可点击的节点引用。
+
+- **输入**：`buildAnalysisInput` 只取目标（≤6）、主干 topic（≤16，含 digest/阶段）、待办、进行中、死路、
+  最近节点与 frontier；超过 `analysis.maxInputChars`（默认 12000）时按
+  recent → deadEnds → doing → frontier → topics → open 顺序裁剪，不发送整棵树。
+- **输出**：严格 JSON——`headline`（≤24 字）、`summary`（≤120 字）、3–6 条
+  `findings`（kind `progress|blocker|risk|insight`，每条带 `nodeIds`）与 2–5 条 `recommendations`；
+  服务端会剥掉代码围栏、丢弃非法 kind 与不存在的节点 id，引用在面板里可点击定位。
+- **路由**：`analysis.provider` / `analysis.model` 任一被显式配置时，整对使用 analysis 路由（缺另一项即视为未配置，不回退）；
+  两项都不配才整对继承 `llm.provider` / `llm.model`；都为空时面板显示「尚未配置模型路由」。
+- **缓存**：成功结果按工作区缓存 `analysis.cacheTtlMs`（默认 10 分钟，最多 20 个工作区），
+  并发请求复用同一次调用；面板「重新解析」带 `force=1` 跳过缓存。
+- **错误码**：`analysis_disabled`（403）、`llm_unavailable`（503）、`llm_not_configured`（400）、
+  `workspace_not_found`（404）、`llm_failed` / `analysis_parse_failed`（502）。
+- **安全**：输入是截断后的图摘要，不含 reasoning 原文；解析结果只进面板/内存缓存，不写图、不改节点。
+- 设置页只有「显示 AI 解析」开关（localStorage 偏好 `showAnalysis`）；模型与预算在 profile 配置的
+  `analysis.*` 里改，见 §6。
+
 面板数据来自本机端点：
 
 ```
 GET /explore-tree/health
 GET /explore-tree/workspaces
-GET /explore-tree/snapshot?workspace=<绝对路径>&focus=<可选节点 id>&limit=<可选>
+GET /explore-tree/snapshot?workspace=<绝对路径>&focus=<可选节点 id>&session=<可选会话 id>
+GET  /explore-tree/analyze?workspace=<绝对路径>
+POST /explore-tree/analyze?workspace=<绝对路径>&force=1
 ```
 
-端点仅接受本机 GET 请求；允许的工作区为 `workspaceRegistry` 已登记、图注册表已打开、
+除 analyze 外均为本机 GET；`analyze` 的 GET 只读配置/缓存，POST 才调用模型（`force=1` 跳过缓存），
+并要求 `Origin` 缺失或为本机回环地址。允许的工作区为 `workspaceRegistry` 已登记、图注册表已打开、
 全局索引里出现过、或 `cwd/.explore-tree/graph.json` 已存在的路径，其它路径 404。
 
 > 当前会话的工具面在**轮次开始时**固定：插件是运行中安装的，本会话要到下一轮（或新会话）
@@ -261,16 +329,16 @@ GET /explore-tree/snapshot?workspace=<绝对路径>&focus=<可选节点 id>&limi
 
 **提取质量门（v0.24）**：分类器命中关键词后还要过 kind 校验——问题必须真的像疑问句，
 假设要有推测/条件/因果机制，决策要有明确取舍，证据不能是 Given/Since 前提，结论不能是
-Fine/Plan 之类泛化词；不通过的句子只进轮次摘要（`note`），不建未决节点。关系不再靠
+Fine/Plan 之类泛化词；不通过的句子只进轮次摘要（`note`），不建待办节点。关系不再靠
 「最近一个想法」猜：依赖型节点只有词面相似达到门槛，或与同段最后一条 approach（中间可夹 note）
 同段时，才挂到假设下，否则挂 step/topic；同轮新节点与更早节点还会补一条 typed edge
 （supports/contradicts/refines/replaces），
 跨轮关系同样去重。
 
-**未决卫生（v0.21，v0.22.1 收口）**：`overview` 与面板不再把全部 open/active 的 `question/hypothesis/decision`
-平铺出来，而是分为「当前未决 / 推理旁白 / 旧主题陈旧项 / 嵌套推理细节」。自动过程句、
-已关闭主题下的旧项和嵌套细节只折叠计数；人工写入、blocker、直接挂在 topic/step/goal 下的未决保留在首屏
-（step/goal 是结构与时间节点，不是想法节点，旧图没有 topic 时也能看到真实未决）。
+**待办卫生（v0.21，v0.22.1 收口，P0 起统一叫待办）**：`overview` 与面板不再把全部 open/active 的 `question/hypothesis/decision`
+平铺出来，而是分为「当前待办 / 推理旁白 / 旧主题陈旧项 / 嵌套推理细节」。自动过程句、
+已关闭主题下的旧项和嵌套细节只折叠计数；人工写入、blocker、直接挂在 topic/step/goal 下的待办保留在首屏
+（step/goal 是结构与时间节点，不是想法节点，旧图没有 topic 时也能看到真实待办）。
 需要批量收敛时用 `src/core/hygiene.js` 的 `planOpenCleanup`：它只改 `status/tags/summary`、不删除节点，
 并写入 `auto-curated` 与 `reasoning-noise`/`stale-topic`/`archived` 标签，可按标签审计或回滚。
 分类与收敛都会跳过 blocker；主题叶根超宽时只隐藏自动的 done/abandoned 叶根，不动人工完成项与 open 叶根；
@@ -280,7 +348,7 @@ Fine/Plan 之类泛化词；不通过的句子只进轮次摘要（`note`），�
 
 ```
 <workspace>/.explore-tree/
-  graph.json        # 当前快照（原子写）
+  graph.json        # 当前快照（原子写；新建 v2，旧图迁移前仍 v1）
   journal.jsonl     # 操作流水；快照 meta.journalOffset 之后的行用于恢复
   archive.jsonl     # 超过 maxNodes 后下沉的旧节点
 ```
@@ -311,6 +379,7 @@ Fine/Plan 之类泛化词；不通过的句子只进轮次摘要（`note`），�
           expandLegacyAnswers: true
           captureAnswerSections: true
           injectBrief: true          # 轮首/压缩后注入研究简报（需已有 goal；首次完整，后续增量）
+          briefMaxChars: 1200        # 简报字符预算（约 300 token；200–4000，按分句边界截断）
           briefScope: workspace      # workspace | goal（简报是否含其他 goal 的主干）
           minAnswerChars: 400
           minSectionChars: 16
@@ -355,6 +424,13 @@ Fine/Plan 之类泛化词；不通过的句子只进轮次摘要（`note`），�
           timeoutMs: 20000
           maxOutputTokens: 1200
           digest: false  # 轮末用 LLM 重写 topic 摘要（可选）
+        analysis:            # 概览页「AI 解析」：手动触发，不自动调用
+          enabled: true
+          # provider/model 任一配置则整对使用 analysis；都不配才继承 llm 路由
+          maxInputChars: 12000
+          timeoutMs: 60000
+          maxOutputTokens: 1600
+          cacheTtlMs: 600000
 ```
 
 | 字段 | 默认 | 说明 |
@@ -377,9 +453,10 @@ Fine/Plan 之类泛化词；不通过的句子只进轮次摘要（`note`），�
 | `extract.detectConclusions` | `true` | 是否识别结论句 |
 | `extract.autoSeedTopic` | `true` | goal 下没有 topic 时，单轮想法达到阈值后自动建候选主题（`candidate`） |
 | `extract.topicSeedMinClaims` | `5` | goal 下完全没有 topic 时的单轮想法数阈值；已有 topic 全部满仓/关闭时单条想法也可另起候选主题 |
-| `extract.maxOpenLeavesPerTopic` | `9` | 单个 topic 下最多承接的 open 叶根；超出后新想法优先挂到未决更少且与意图相关的主题，全部满仓/无关才自动建候选主题 |
+| `extract.maxOpenLeavesPerTopic` | `9` | 单个 topic 下最多承接的 open 叶根；超出后新想法优先挂到待办更少且与意图相关的主题，全部满仓/无关才自动建候选主题 |
 | `extract.topicIntentThreshold` | `0.12` | 本轮用户意图与主题（标题/digest/叶根）的最低相似度；低于此值不复用该主题，避免新请求堆进旧主题；设 0 表示只看容量 |
 | `injectBrief` | `true` | 有 goal 时轮首注入「研究轨迹简报」：首次完整，之后只推新增/完成/放弃/更新，无变化跳过；`compaction/end` 后强制补完整简报；同一轮最多一次，没有 goal 不打扰 |
+| `briefMaxChars` | `1200` | 简报字符预算（约 300 token；200–4000，按分句边界截断） |
 | `briefScope` | `workspace` | 简报范围：`workspace` 额外列「其他主干：…」（同工作区其他 goal 的 topic + digest/owner），多 agent 默认；`goal` 只看当前会话 goal |
 | `extract.ignoreTools` | 插件自身两个工具 | 自动提取忽略的工具名 |
 | `extract.maxAutoNodesPerTurn` | `80` | 单轮自动节点总上限 |
@@ -410,6 +487,11 @@ Fine/Plan 之类泛化词；不通过的句子只进轮次摘要（`note`），�
 | `llm.maxInputChars` | `12000` | 送给模型的推理摘录上限（头 70% + 尾 30%） |
 | `llm.timeoutMs` / `llm.maxOutputTokens` | `20000` / `1200` | 单次调用超时与输出上限 |
 | `llm.digest` | `false` | 轮末用 LLM 重写 topic digest（失败回退模板；human 摘要不覆盖） |
+| `analysis.enabled` | `true` | 是否允许概览页「AI 解析」；`false` 时 POST 返回 403 |
+| `analysis.provider` / `analysis.model` | — | 独立模型路由；任一配置则整对使用 analysis（缺一即未配置），都不配才继承 `llm.provider` / `llm.model` |
+| `analysis.maxInputChars` | `12000` | 送给模型的图摘要上限（2000–40000，超限按优先级裁剪） |
+| `analysis.timeoutMs` / `analysis.maxOutputTokens` | `60000` / `1600` | 单次解析超时与输出上限 |
+| `analysis.cacheTtlMs` | `600000` | 成功结果缓存时长（0–3600000；`force=1` 跳过） |
 
 所有字段都有安全默认值；坏配置回退默认，不阻断插件加载。
 
@@ -445,14 +527,21 @@ src/
     config.js         配置归一化
 lib/client.js         浏览器 bundle（手写，无构建；conversation.view 页签 + settings.section 设置分区）
 docs/design.md        设计契约
-scripts/              install / status / smoke / uninstall（e2e）+ audit-graph / rebuild / migrate-trunk（旧图体检、修复、主干迁移）
-test/unit/            node:test 单测（203 项，13 suites）
+docs/schema.md        graph.json 磁盘格式、v1/v2 兼容与 P2 迁移/回滚
+docs/multi-agent-collaboration.md  多 agent 同树协作（现状/并发实测/P5 设计）
+docs/multi-agent-experiment.md     三模型并发控制实验（450 runs + 协作案例）
+docs/h4-ab-protocol.md             H4 单 agent 对照协议（预注册草案，未执行）
+experiments/cc-sim/   实验模拟器（occ-lease / crdt-lww / crdt-repair）
+research/             T1–T4 产物（文献、数据、图表、验证、交接）
+docs/research/        宿主/客户端 API 调研
+scripts/              install / status / smoke / uninstall（e2e）+ audit-graph / rebuild / migrate-trunk / migrate-close-reason（旧图体检、修复、主干/结束原因迁移）
+test/unit/            node:test 单测（229 项，13 suites）
 ```
 
 ## 9. 开发与测试
 
 ```powershell
-npm test                 # node --test "test/unit/*.test.js"，203 项
+npm test                 # node --test "test/unit/*.test.js"，229 项
 node --check lib/client.js
 node --check src/index.js
 
@@ -474,23 +563,31 @@ Release 并上传 tarball。tag 与版本不一致会在打包前直接失败。
 
 ```powershell
 # 先提交版本号与 CHANGELOG，再打 tag 推送；版本号必须与 tag 去掉 v 后一致
-git tag v0.26.3
-git push origin main v0.26.3
+git tag v0.31.0
+git push origin main v0.31.0
 ```
 
-### 旧图体检、修复与主干迁移（P3/P2）
+### 旧图体检、修复、主干与结束原因迁移（P3/P2）
 
 ```powershell
 node scripts/audit-graph.mjs --workspace .      # 只读体检
 node scripts/rebuild.mjs --workspace .          # dry-run：旧图污染修复
 node scripts/migrate-trunk.mjs --workspace .    # dry-run：step 下的语义节点 → topic/叶根
+node scripts/migrate-close-reason.mjs --workspace .  # dry-run：旧图 closeReason/resolutionBy 回填
 # 先停掉 dsh web，再加 --apply 写回（都会先备份 graph.json）：
 node scripts/migrate-trunk.mjs --workspace . --apply
+node scripts/migrate-close-reason.mjs --workspace . --apply
 ```
 
 迁移规则：先给 goal 建 topic（或等自动种子）；脚本按「节点文本 ↔ topic 标题+摘要」相似度选主题
 （`--threshold`，默认 0.05），approach 直接成为叶根，dependent 跟随同 step 已迁移的叶根；
 补 `stepId`、打 `trunk-migrated` 标签并重算摘要。没有 topic 时只提示，不动图。
+
+结束原因迁移：已有 `closeReason` 跳过；auto-curated→curated、merged-into→duplicate、
+工具噪音/中断→aborted、dead_end→dead_end、done 记录类/决策→recorded、done goal/topic→solved、
+done step/action→completed。只加字段、不改 status，迁移前后校验 `status` 计数；
+`--revert --apply` 只清 `resolutionBy=migrated`。规则与 v1/v2 兼容见
+[docs/schema.md](docs/schema.md)。
 
 ```powershell
 node scripts/audit-graph.mjs --workspace .   # 只读体检：假 goal / artifact 根 / 重复 step / 污染标题 / note/边/深度
@@ -522,11 +619,11 @@ artifact 根挂回会话 goal；重复 step 合并子树与边；旧 note 打 `l
 - **可认领提示**：`trunk` / `brief` 会列「可认领：…」；`frontier` 对过期租约给 `claim` 建议；
   `team` 读取真实 Agent Teams 成员/任务，并保留树侧「我的主题/待认领/租约过期/冲突」；认领/交接前先看它；
   `assign` 后 `owner` 显示在 topic 卡片与 trunk 行里。
-- **交接**：`brief`（≤400 字：目标 / 主干 digest / 其他主干 / 未决叶根 / 下一步）就是交接包；默认 `briefScope=workspace`，接手者能看到同工作区其他 goal 的共享主干，不再只看见自己 goal 的碎片；
+- **交接**：`brief`（≤1200 字：目标 / 主干 digest / 其他主干 / 待办叶根 / 下一步）就是交接包；默认 `briefScope=workspace`，接手者能看到同工作区其他 goal 的共享主干，不再只看见自己 goal 的碎片；
   `trunk` 是主干地图；两者都只读子摘要，不展开细节。
 - **交接（v0.20）**：`explore_tree_record({action:'handoff', id:'n77', actor:'agent-a', toActor:'agent-b'})`
   在一个图操作里把租约转给 `toActor`，并在 topic 下写一条 `tags:['handoff']` 的交接包
-  （digest + 未决叶根 + 最近关键节点）；交接包不算叶根，不会污染主干进度。
+  （digest + 待办叶根 + 最近关键节点）；交接包不算叶根，不会污染主干进度。
 - **自动提取归属（v0.20）**：自动生成的节点带 `createdBy/updatedBy: extractor`，
   可在 `node` 详情与 journal 中区分系统提取和 agent 显式写；写域仍只对显式 `actor` 生效。
 - **Team 映射（v0.26）**：`topicTaskPayload(topic)`（`src/core/trunk.js`）给出

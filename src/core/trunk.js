@@ -14,6 +14,7 @@ import { fingerprint } from './fingerprint.js';
 import { computeFrontier } from './frontier.js';
 import { childrenOf, isDescendant, updateNode } from './graph.js';
 import { isAutoCuratedNode } from './hygiene.js';
+import { phaseOf, statusDigest } from './status.js';
 import {
     clampText,
     isLeafRootKind,
@@ -91,13 +92,19 @@ export function topicConflicts(state, topicId) {
         && nearestTopicOf(state, edge.to) === topicId);
 }
 
-/** 主题进度：直接叶根的完成数与总数。 */
+/**
+ * 主题进度：直接叶根的完成数、待办数、真死路数。
+ * P0 起「待办」只算研究结论类（phase=todo），不再把所有非 done/abandoned 都算进来。
+ */
 export function topicProgress(state, topicId) {
     const roots = leafRootsOf(state, topicId);
+    const todo = roots.filter((node) => phaseOf(node) === 'todo').length;
     return {
         total: roots.length,
         done: roots.filter((node) => node.status === 'done').length,
-        open: roots.filter((node) => node.status !== 'done' && node.status !== 'abandoned').length,
+        open: todo,
+        todo,
+        dead: roots.filter((node) => phaseOf(node) === 'dead_end').length,
     };
 }
 
@@ -282,7 +289,9 @@ export function trunkStats(state) {
         topics: topics.length,
         leafRoots: leafRoots.length,
         doneLeafRoots: leafRoots.filter((node) => node.status === 'done').length,
-        openLeafRoots: leafRoots.filter((node) => node.status !== 'done' && node.status !== 'abandoned').length,
+        openLeafRoots: leafRoots.filter((node) => phaseOf(node) === 'todo').length,
+        todoLeafRoots: leafRoots.filter((node) => phaseOf(node) === 'todo').length,
+        deadLeafRoots: leafRoots.filter((node) => phaseOf(node) === 'dead_end').length,
         ownedTopics: topics.filter((node) => typeof node.owner === 'string' && node.owner !== '').length,
         semanticUnderStep: semanticUnderStep.length,
         staleDigests: topics.filter((node) => isDigestStale(state, node)).length,
@@ -361,7 +370,7 @@ export function renderTrunk(state, opts = {}) {
     let hiddenArchived = 0;
     const stats = trunkStats(state);
     const lines = [];
-    lines.push(`研究主干：${stats.topics} 个主题 / ${stats.leafRoots} 个叶根（完成 ${stats.doneLeafRoots}）`);
+    lines.push(`研究主干：${stats.topics} 个主题 / ${stats.leafRoots} 个叶根（待办 ${stats.todoLeafRoots} / 完成 ${stats.doneLeafRoots} / 真死路 ${stats.deadLeafRoots}）`);
     const goals = trunkOf(state, { goalId });
     if (goals.length === 0) {
         lines.push('（还没有 goal：先用 record add 建一个目标）');
@@ -481,13 +490,13 @@ export function trunkFrontier(state, opts = {}) {
     for (const topic of topics) {
         if (topic.status === 'done' || topic.status === 'abandoned' || isArchived(topic)) continue;
         const leaves = leafRootsOf(state, topic.id);
-        const open = leaves.filter((node) => node.status !== 'done' && node.status !== 'abandoned');
+        const open = leaves.filter((node) => phaseOf(node) === 'todo');
         if (open.length > 0) {
             items.push({
                 type: 'advance',
                 targetId: topic.id,
                 priority: topic.priority ?? null,
-                reason: `${open.length} 个未决叶根：${open.slice(0, 2).map((node) => node.title).join('；')}`,
+                reason: `${open.length} 个待办叶根：${open.slice(0, 2).map((node) => node.title).join('；')}`,
             });
         }
         const lease = leaseStatus(topic);
@@ -541,12 +550,62 @@ function briefGoalOf(state, sessionId) {
     return goals[goals.length - 1] ?? null;
 }
 
+/** 轮首简报的默认长度上限（字符；约 300 token）。 */
+export const BRIEF_MAX_CHARS = 1200;
+
 /**
- * ≤400 字研究简报：目标 / 主干 digest / 未决叶根 / 主干 + 叶子建议。
+ * 归一化简报长度上限：默认 1200 字符（约 300 token），下限 200、上限 4000。
+ * @param {unknown} value
+ */
+export function briefMaxCharsOf(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return BRIEF_MAX_CHARS;
+    return Math.max(200, Math.min(4000, Math.floor(n)));
+}
+
+/** 在分句边界截断一行，避免把句子切成半个词。 */
+function cutBriefLine(line, room) {
+    if (line.length <= room) return line;
+    const slice = line.slice(0, Math.max(1, room - 1));
+    let cut = -1;
+    for (const separator of ['；', '。', '，', ' ']) {
+        cut = Math.max(cut, slice.lastIndexOf(separator));
+    }
+    const body = cut >= Math.floor(room * 0.55) ? slice.slice(0, cut + 1) : slice;
+    return `${body.trimEnd()}…`;
+}
+
+/** 按行拼装，最后一行在预算内按分句截断；总长度不超过 maxChars。 */
+function fitBriefText(lines, maxChars) {
+    let text = '';
+    for (const line of lines) {
+        if (text === '') {
+            if (line.length <= maxChars) {
+                text = line;
+                continue;
+            }
+            return cutBriefLine(line, maxChars);
+        }
+        const candidate = `${text}\n${line}`;
+        if (candidate.length <= maxChars) {
+            text = candidate;
+            continue;
+        }
+        const room = maxChars - text.length - 1;
+        if (room > 32) text = `${text}\n${cutBriefLine(line, room)}`;
+        else if (maxChars - text.length >= 1) text = `${text}…`;
+        break;
+    }
+    return text;
+}
+
+/**
+ * 研究简报：目标 / 主干 digest / 未决叶根 / 主干 + 叶子建议。
  * 轮首或 compaction 后注入时使用（source.kind = explore-tree-context）。
+ * 默认上限 1200 字符（约 300 token），可用 options.maxChars 覆盖。
  *
  * @param {object} state
- * @param {{sessionId?: string|null, focusId?: string|null, limit?: number, scope?: 'workspace'|'goal'}} [options]
+ * @param {{sessionId?: string|null, focusId?: string|null, limit?: number, maxChars?: number, scope?: 'workspace'|'goal'}} [options]
  *   scope='workspace'（默认）时额外列「其他主干」，让同工作区的其他 goal 可见；
  *   scope='goal' 保留旧的单 goal 视图。
  */
@@ -554,6 +613,7 @@ export function renderBrief(state, options = {}) {
     const sessionId = typeof options.sessionId === 'string' ? options.sessionId : null;
     const focusId = options.focusId ?? null;
     const limit = Number.isInteger(options.limit) ? Math.max(1, Math.min(5, options.limit)) : 3;
+    const maxChars = briefMaxCharsOf(options.maxChars);
     const scope = options.scope === 'goal' ? 'goal' : 'workspace';
     const goal = briefGoalOf(state, sessionId);
     const topics = goal !== null ? childrenOf(state, goal.id).filter((node) => isTopic(node)) : [];
@@ -570,14 +630,16 @@ export function renderBrief(state, options = {}) {
                     || (a.order ?? 0) - (b.order ?? 0);
             })
         : [];
-    const lines = [`【研究轨迹简报】目标：${goal !== null ? goal.title : '（未建目标）'}`];
+    const digest = statusDigest(state, { sessionId });
+    const digestScope = digest.scope === 'session' ? '（本会话）' : '';
+    const lines = [`【研究轨迹简报】待办 ${digest.todo.visible}${digestScope}（强 ${digest.todo.strong}）· 进行中 ${digest.doing} · 死路 ${digest.deadEnd} · 目标：${goal !== null ? clampText(goal.title, 80) : '（未建目标）'}`];
     if (topics.length === 0) {
         lines.push('主干：尚未建立（record add kind=topic 建主题，再把叶根挂上去）');
     } else {
-        const summary = topics.slice(0, 4).map((topic) => {
+        const summary = topics.slice(0, 6).map((topic) => {
             const label = typeof topic.digest === 'string' && topic.digest !== '' ? topic.digest : (topic.summary ?? '');
             const conflict = topicConflicts(state, topic.id).length > 0 ? '⚠冲突' : '';
-            return `${topic.title}${label !== '' ? `（${label}）` : ''}${conflict}`;
+            return `${clampText(topic.title, 60)}${label !== '' ? `（${clampText(label, 60)}）` : ''}${conflict}`;
         });
         lines.push(`主干：${summary.join('；')}`);
         const conflicted = topics.filter((topic) => topicConflicts(state, topic.id).length > 0);
@@ -586,40 +648,39 @@ export function renderBrief(state, options = {}) {
         }
     }
     if (otherTopics.length > 0) {
-        const shown = otherTopics.slice(0, 2).map((topic) => {
+        const shown = otherTopics.slice(0, 4).map((topic) => {
             const label = typeof topic.digest === 'string' && topic.digest !== '' ? topic.digest : (topic.summary ?? '');
             const owner = typeof topic.owner === 'string' && topic.owner !== '' ? ` @${topic.owner}` : '';
-            return `${topic.title}${owner}${label !== '' ? `（${label}）` : ''}`;
+            return `${clampText(topic.title, 60)}${owner}${label !== '' ? `（${clampText(label, 60)}）` : ''}`;
         });
         lines.push(`其他主干：${shown.join('；')}`);
     }
     const openLeaves = [];
     for (const topic of topics) {
         for (const leaf of leafRootsOf(state, topic.id)) {
-            if (leaf.status === 'done' || leaf.status === 'abandoned') continue;
+            if (phaseOf(leaf) !== 'todo') continue;
             openLeaves.push({ leaf, topic });
         }
     }
     openLeaves.sort((a, b) => leafRootImportance(b.leaf) - leafRootImportance(a.leaf));
     if (openLeaves.length > 0) {
-        lines.push(`未决：${openLeaves.slice(0, 3).map(({ leaf, topic }) => `${leaf.title}（${topic.title}）`).join('；')}`);
+        lines.push(`待办叶根：${openLeaves.slice(0, 6).map(({ leaf, topic }) => `${clampText(leaf.title, 60)}（${clampText(topic.title, 40)}）`).join('；')}`);
     }
     const claimable = claimableTopics(state);
     if (claimable.length > 0) {
         lines.push(`可认领：${claimable.slice(0, 3).map((topic) => topic.title).join('；')}`);
     }
-    const trunk = trunkFrontier(state, { limit: 2 });
+    const trunk = trunkFrontier(state, { limit: 3 });
     if (trunk.length > 0) {
-        lines.push(`主干建议：${trunk.map((item) => `[${item.type}] ${item.targetId} ${item.reason}`).join('；')}`);
+        lines.push(`主干建议：${trunk.map((item) => `[${item.type}] ${item.targetId} ${clampText(item.reason, 90)}`).join('；')}`);
     }
-    const frontier = computeFrontier(state, { sessionId, focusId, limit: 2 });
-    const leaf = (frontier.suggestions ?? []).slice(0, 2).map((item) => {
+    const frontier = computeFrontier(state, { sessionId, focusId, limit: 3 });
+    const leaf = (frontier.suggestions ?? []).slice(0, 3).map((item) => {
         const target = item.targetId !== null && item.targetId !== undefined ? ` ${item.targetId}` : '';
-        return `[${item.type}]${target} ${item.reason}`;
+        return `[${item.type}]${target} ${clampText(item.reason, 90)}`;
     });
     if (leaf.length > 0) lines.push(`叶子建议：${leaf.join('；')}`);
-    const text = lines.join('\n');
-    return text.length <= 400 ? text : `${text.slice(0, 399)}…`;
+    return fitBriefText(lines, maxChars);
 }
 
 /**
@@ -658,7 +719,7 @@ const BRIEF_DELTA_PRIORITY = Object.freeze({
     hypothesis: 2, question: 2, evidence: 1,
 });
 
-function briefDeltaChangedTitles(nodes, max = 3) {
+function briefDeltaChangedTitles(nodes, max = 5) {
     const shown = nodes.slice(0, max)
         .map((node) => clampText(String(node.title ?? ''), 50))
         .filter((title) => title !== '');
@@ -667,17 +728,19 @@ function briefDeltaChangedTitles(nodes, max = 3) {
 }
 
 /**
- * 与上次简报相比的增量：新增关键节点 / 完成 / 放弃 / 标题或父节点变化 / 合并移除。
+ * 与上次简报相比的增量：新增关键节点 / 完成 / 放弃 / 标题或父节点变化 / 合并移除，
+ * 并带一行当前待办口径与下一步。默认上限 1200 字符（约 300 token）。
  * 没有值得说的变化时返回空串，调用方跳过注入，避免每轮重复同一份简报。
  *
  * @param {object} state
  * @param {Map<string, object>} previous snapshotBriefState 的返回值
- * @param {{sessionId?: string|null}} [options]
+ * @param {{sessionId?: string|null, maxChars?: number}} [options]
  * @returns {string}
  */
 export function renderBriefDelta(state, previous, options = {}) {
     if (!(previous instanceof Map) || previous.size === 0) return renderBrief(state, options);
     const sessionId = typeof options.sessionId === 'string' ? options.sessionId : null;
+    const maxChars = briefMaxCharsOf(options.maxChars);
     const goal = briefGoalOf(state, sessionId);
     const current = snapshotBriefState(state);
     const added = [];
@@ -711,22 +774,35 @@ export function renderBriefDelta(state, previous, options = {}) {
     abandoned.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
     updated.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
 
+    const digest = statusDigest(state, { sessionId });
+    const digestScope = digest.scope === 'session' ? '（本会话）' : '';
+    const counts = `待办 ${digest.todo.visible}${digestScope}（强 ${digest.todo.strong}）· 进行中 ${digest.doing} · 死路 ${digest.deadEnd}`;
     const lines = [goal !== null
-        ? `【研究轨迹增量】目标：${goal.title}`
-        : '【研究轨迹增量】'];
+        ? `【研究轨迹增量】${counts} · 目标：${clampText(goal.title, 80)}`
+        : `【研究轨迹增量】${counts}`];
     if (added.length > 0) {
-        const text = added.slice(0, 3)
-            .map((node) => `${BRIEF_DELTA_LABELS[node.kind] ?? node.kind}「${clampText(node.title, 40)}」`)
+        const text = added.slice(0, 6)
+            .map((node, index) => {
+                const title = clampText(node.title, 50);
+                const full = state.nodes.get(node.id);
+                const summary = index < 3 ? clampText(String(full?.summary ?? ''), 60) : '';
+                return `${BRIEF_DELTA_LABELS[node.kind] ?? node.kind}「${title}」${summary !== '' ? `：${summary}` : ''}`;
+            })
             .join('；');
-        lines.push(`新增：${text}${added.length > 3 ? ` 等 ${added.length} 项` : ''}`);
+        lines.push(`新增：${text}${added.length > 6 ? ` 等 ${added.length} 项` : ''}`);
     }
     if (completed.length > 0) lines.push(`完成：${briefDeltaChangedTitles(completed)}`);
     if (abandoned.length > 0) lines.push(`放弃：${briefDeltaChangedTitles(abandoned)}`);
     if (updated.length > 0) lines.push(`更新：${briefDeltaChangedTitles(updated)}`);
     if (removed.length > 0) lines.push(`合并/移除：${briefDeltaChangedTitles(removed)}`);
     if (lines.length === 1) return '';
-    const text = lines.join('\n');
-    return text.length <= 400 ? text : `${text.slice(0, 399)}…`;
+    const frontier = computeFrontier(state, { sessionId, limit: 2 });
+    const next = (frontier.suggestions ?? []).slice(0, 2).map((item) => {
+        const target = item.targetId !== null && item.targetId !== undefined ? ` ${item.targetId}` : '';
+        return `[${item.type}]${target} ${clampText(item.reason, 80)}`;
+    });
+    if (next.length > 0) lines.push(`下一步：${next.join('；')}`);
+    return fitBriefText(lines, maxChars);
 }
 
 /**

@@ -235,3 +235,4 @@ else {
   process.stdout.write(`  check:   dsh --profile ${profile} --dump-config | Select-String '${name}'\n`)
   process.stdout.write(`note: a running dsh web drops the plugin live (HMR), usually within a few seconds.\n`)
 }
+

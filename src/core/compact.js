@@ -14,7 +14,8 @@ import {
     relatedNodes,
     rootNodes,
 } from './graph.js';
-import { collectOpenItems, isAutoCuratedNode } from './hygiene.js';
+import { collectOpenItems } from './hygiene.js';
+import { formatDigest, isTrueDeadEnd, statusDigest } from './status.js';
 
 const STATUS_MARK = Object.freeze({
     open: '○',
@@ -150,10 +151,13 @@ export function renderOverview(state, { sessionId = null, focusId = null, limit 
     const session = sessionId !== null ? state.sessions.get(sessionId) : undefined;
     // 指定会话时只汇总本会话的节点：树跨会话共享，overview 不该把别的会话的历史重新贴一遍。
     const inSession = (node) => sessionId === null || node.sessionId === sessionId;
+    const digest = statusDigest(state, { sessionId });
     const focus = focusId ?? session?.activeNodeId ?? null;
     const lines = [];
     lines.push(`研究图：${state.workspaceRoot}`);
-    lines.push(`规模：${stats.nodes} 节点 / ${stats.edges} 关系 / ${stats.sessions} 会话；状态 ${formatCounts(stats.byStatus)}`);
+    lines.push(`规模：${stats.nodes} 节点 / ${stats.edges} 关系 / ${stats.sessions} 会话`);
+    lines.push(`状态：${formatDigest(digest)}`);
+    if (digest.scope === 'session') lines.push(`全图：${formatDigest(statusDigest(state), { compact: true })}`);
     if (state.meta?.lastSessionId !== undefined && sessionId === null) {
         lines.push(`最近会话：${state.meta.lastSessionId}`);
     }
@@ -181,21 +185,25 @@ export function renderOverview(state, { sessionId = null, focusId = null, limit 
     }
 
     const open = collectOpenItems(state, { sessionId, limit: 8 });
+    const scope = digest.scope === 'session' ? ' · 本会话' : ' · 全图';
     if (open.visibleCount > 0) {
         const folded = open.hiddenCount > 0
             ? `（已折叠 ${open.hiddenCount}：旁白 ${open.noiseCount} / 旧主题 ${open.staleCount} / 推理细节 ${open.detailCount}）`
             : '';
-        lines.push(`未决（${open.visibleCount}）${folded}：`);
+        lines.push(`待办（${open.visibleCount}${scope}；强 ${digest.todo.strong} / 自动 ${digest.todo.weak}）${folded}：`);
         for (const item of open.visible) lines.push(`  ${nodeLine(item.node, { maxTitle: 80 })}`);
     } else if (open.total > 0) {
-        // 全部被折叠时不要把「0」当成没有未决：明确写出可展示 0 与折叠明细。
-        lines.push(`未决（0 可展示；已折叠 ${open.hiddenCount}：旁白 ${open.noiseCount} / 旧主题 ${open.staleCount} / 推理细节 ${open.detailCount}）：`);
+        // 全部被折叠时不要把「0」当成没有待办：明确写出可展示 0 与折叠明细。
+        lines.push(`待办（0 可展示${scope}；已折叠 ${open.hiddenCount}：旁白 ${open.noiseCount} / 旧主题 ${open.staleCount} / 推理细节 ${open.detailCount}）：`);
     }
 
-    const deadEnds = [...state.nodes.values()].filter((node) => (node.kind === 'dead_end' || node.status === 'abandoned')
-        && !isAutoCuratedNode(node) && inSession(node));
+    const deadCandidates = [...state.nodes.values()]
+        .filter((node) => (node.kind === 'dead_end' || node.status === 'abandoned') && inSession(node));
+    const deadEnds = deadCandidates.filter((node) => isTrueDeadEnd(node));
     if (deadEnds.length > 0) {
-        lines.push(`已知死路（${deadEnds.length}，避免重复）：`);
+        const folded = deadCandidates.length - deadEnds.length;
+        const suffix = folded > 0 ? `；已折叠 ${folded} 条工具失败/已合并/自动收敛` : '';
+        lines.push(`研究死路（${deadEnds.length}${scope}，避免重复${suffix}）：`);
         for (const node of deadEnds.slice(0, 6)) {
             lines.push(`  ${node.id} ${truncate(node.title, 70)}${node.summary !== '' ? ` — ${truncate(node.summary.split('\n')[0], 100)}` : ''}`);
         }
@@ -240,7 +248,8 @@ export function renderStats(state) {
     const lines = [
         `节点 ${stats.nodes} · 关系 ${stats.edges} · 根 ${stats.roots} · 会话 ${stats.sessions}`,
         `类型：${formatCounts(stats.byKind)}`,
-        `状态：${formatCounts(stats.byStatus)}`,
+        `原始状态（兼容/调试）：${formatCounts(stats.byStatus)}`,
+        `语义状态：${formatDigest(statusDigest(state))}`,
         `创建者：${formatTopActors(stats.byCreator)}`,
         `最近更新：${formatTopActors(stats.byUpdater)}`,
         `重复命中：${stats.repeated} · 假设：${stats.hypotheses}（未验证 ${stats.unverifiedHypotheses}）· 死路：${stats.deadEnds} · 结论：${stats.conclusions} · 产物：${stats.artifacts}`,

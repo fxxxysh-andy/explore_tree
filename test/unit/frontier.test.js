@@ -68,7 +68,7 @@ test('compact 渲染包含节点 id 与树结构', () => {
     assert.match(tree, /步骤/);
 });
 
-test('overview：未决列表折叠推理旁白与已关闭主题的陈旧项', () => {
+test('overview：待办列表折叠推理旁白与已关闭主题的陈旧项', () => {
     const graph = state();
     const goal = addNode(graph, { kind: 'goal', title: '目标', status: 'active' }, { now: NOW });
     const topic = addNode(graph, { kind: 'topic', parentId: goal.id, title: '活跃主题', status: 'active' }, { now: NOW });
@@ -78,9 +78,9 @@ test('overview：未决列表折叠推理旁白与已关闭主题的陈旧项', 
     addNode(graph, { kind: 'hypothesis', parentId: closed.id, title: 'Read the docs before deciding.', origin: 'auto' }, { now: NOW });
 
     const overview = renderOverview(graph, { sessionId: null });
-    assert.match(overview, /未决（1）/);
+    assert.match(overview, /待办（1 · 全图/);
     assert.match(overview, /已折叠 2/);
-    const openSection = overview.slice(overview.indexOf('未决（1）'), overview.indexOf('可用动作'));
+    const openSection = overview.slice(overview.indexOf('待办（1'), overview.indexOf('可用动作'));
     assert.doesNotMatch(openSection, /Let me read the README/);
     assert.doesNotMatch(openSection, /Read the docs before deciding/);
     assert.match(openSection, /是否应该保留未决列表/);
@@ -97,9 +97,9 @@ test('overview：没有 topic 的旧图里 step 下的未决不被折叠为零�
         origin: 'auto',
     }, { now: NOW });
     const overview = renderOverview(graph, { sessionId: null });
-    assert.match(overview, /未决（1）/);
+    assert.match(overview, /待办（1 · 全图/);
     assert.match(overview, /没有 topic 时这个问题还要不要做/);
-    assert.doesNotMatch(overview, /未决（0）/);
+    assert.doesNotMatch(overview, /待办（0/);
 });
 
 test('auto-curated 的自动收敛项不再被当成死路参与 frontier/overview', () => {

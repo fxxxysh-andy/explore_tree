@@ -20,6 +20,7 @@ import {
 import { computeFrontier } from '../core/frontier.js';
 import { computeTeamBoard, computeWalk, renderTeamBoard, renderWalk } from '../core/navigate.js';
 import { childrenOf, ensureRevision, graphStats, LeaseError, requireNode, StaleRevisionError } from '../core/graph.js';
+import { CLOSE_REASONS, RESOLUTION_BY, normalizeCloseReason, normalizeResolutionBy } from '../core/model.js';
 import {
     digestBasisOf,
     isLeafRoot,
@@ -288,6 +289,8 @@ export function buildToolDefinitions(service) {
                 title: { type: 'string', description: '节点标题（一句话）。' },
                 summary: { type: 'string', description: '摘要：理由、证据、引用；失败节点必须写失败原因。' },
                 status: { type: 'string', description: 'open/active/done/abandoned。' },
+                closeReason: { type: 'string', enum: CLOSE_REASONS, description: '结束原因：solved/dead_end/superseded/duplicate/curated/aborted/recorded。close 问题/假设时必须显式给 solved 或 dead_end；其他 kind 省略时按类型取默认。' },
+                resolutionBy: { type: 'string', enum: RESOLUTION_BY, description: '结束者：human/auto/migrated；工具 close 默认 human，merge 默认 auto。' },
                 confidence: { type: 'number', description: '0-1 置信度；高置信度但无证据会被 frontier 标成过度自信。' },
                 tags: { type: 'array', items: { type: 'string' }, description: '标签。' },
                 refs: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '引用 [{kind:url|file|tool_call|artifact|session|message, value, label}]。' },
@@ -315,6 +318,8 @@ export function buildToolDefinitions(service) {
                             title: { type: 'string' },
                             summary: { type: 'string' },
                             status: { type: 'string' },
+                            closeReason: { type: 'string', enum: CLOSE_REASONS },
+                            resolutionBy: { type: 'string', enum: RESOLUTION_BY },
                             confidence: { type: 'number' },
                             tags: { type: 'array', items: { type: 'string' } },
                         },
@@ -372,6 +377,11 @@ export function buildToolDefinitions(service) {
                                 title: args.title,
                                 summary: typeof args.summary === 'string' ? args.summary : '',
                                 status: typeof args.status === 'string' ? args.status : undefined,
+                                closeReason: typeof args.closeReason === 'string' ? args.closeReason : undefined,
+                                resolutionBy: typeof args.resolutionBy === 'string'
+                                    ? args.resolutionBy
+                                    : (args.status === 'done' || args.status === 'abandoned'
+                                        || (args.status === undefined && args.kind === 'conclusion') ? 'human' : undefined),
                                 confidence: typeof args.confidence === 'number' ? args.confidence : undefined,
                                 tags: pickList(args.tags),
                                 refs: Array.isArray(args.refs) ? args.refs : undefined,
@@ -400,6 +410,11 @@ export function buildToolDefinitions(service) {
                                     title: child.title,
                                     summary: typeof child.summary === 'string' ? child.summary : '',
                                     status: typeof child.status === 'string' ? child.status : undefined,
+                                    closeReason: typeof child.closeReason === 'string' ? child.closeReason : undefined,
+                                    resolutionBy: typeof child.resolutionBy === 'string'
+                                        ? child.resolutionBy
+                                        : (child.status === 'done' || child.status === 'abandoned'
+                                            || (child.status === undefined && child.kind === 'conclusion') ? 'human' : undefined),
                                     confidence: typeof child.confidence === 'number' ? child.confidence : undefined,
                                     tags: pickList(child.tags),
                                     origin: 'model',
@@ -425,7 +440,7 @@ export function buildToolDefinitions(service) {
                     case 'update': {
                         const id = requireString(args.id, 'update');
                         const patch = {};
-                        for (const key of ['kind', 'title', 'summary', 'status', 'confidence', 'tags', 'refs', 'owner', 'leaseUntil', 'priority', 'stepId']) {
+                        for (const key of ['kind', 'title', 'summary', 'status', 'closeReason', 'resolutionBy', 'confidence', 'tags', 'refs', 'owner', 'leaseUntil', 'priority', 'stepId']) {
                             if (args[key] !== undefined) patch[key] = args[key];
                         }
                         if (args.digest !== undefined) {
@@ -435,6 +450,10 @@ export function buildToolDefinitions(service) {
                         if (args.reason !== undefined) {
                             const node = requireNode(state, id);
                             patch.summary = `${node.summary}${node.summary === '' ? '' : '\n'}${args.reason}`;
+                        }
+                        if ((patch.status === 'done' || patch.status === 'abandoned' || patch.closeReason !== undefined)
+                            && patch.resolutionBy === undefined) {
+                            patch.resolutionBy = 'human';
                         }
                         const actor = actorOf(args, exec);
                         const expectedRevision = expectedRevisionOf(args);
@@ -486,8 +505,20 @@ export function buildToolDefinitions(service) {
                     }
                     case 'close': {
                         const id = requireString(args.id, 'close');
-                        const patch = { status: 'done' };
                         const node = requireNode(state, id);
+                        const explicitReason = normalizeCloseReason(args.closeReason);
+                        if (node.kind === 'question' || node.kind === 'hypothesis') {
+                            if (explicitReason !== 'solved' && explicitReason !== 'dead_end') {
+                                return { ok: false, action, text: `close ${id}：问题/假设必须显式给 closeReason=solved（已解决）或 dead_end（此路不通）。` };
+                            }
+                        }
+                        const fallbackReason = node.kind === 'goal' || node.kind === 'topic'
+                            ? 'solved'
+                            : (node.kind === 'step' || node.kind === 'action' ? 'completed'
+                                : (node.kind === 'dead_end' ? 'dead_end' : 'recorded'));
+                        const closeReason = explicitReason ?? fallbackReason;
+                        const resolutionBy = normalizeResolutionBy(args.resolutionBy, 'human');
+                        const patch = { status: 'done', closeReason, resolutionBy };
                         const reason = typeof args.reason === 'string' ? args.reason.trim() : '';
                         patch.summary = reason === '' ? node.summary : `${node.summary}${node.summary === '' ? '' : '\n'}关闭说明：${reason}`;
                         const actor = actorOf(args, exec);
@@ -501,7 +532,7 @@ export function buildToolDefinitions(service) {
                             ...(expectedRevision !== undefined ? { expectedRevision } : {}),
                         });
                         await refreshTrunkUp(store, id);
-                        return { ok: true, action, id, text: `已关闭 ${id}（done）${reason === '' ? '' : `：${reason}`}` };
+                        return { ok: true, action, id, text: `已关闭 ${id}（done · ${closeReason} · ${resolutionBy}）${reason === '' ? '' : `：${reason}`}` };
                     }
                     case 'reopen': {
                         const id = requireString(args.id, 'reopen');
@@ -510,7 +541,7 @@ export function buildToolDefinitions(service) {
                         if (node.kind === 'dead_end' && reason === '') {
                             return { ok: false, action, text: `reopen 死路 ${id} 需要 reason：写清这次有什么新证据，否则 frontier 会继续把它当死路。` };
                         }
-                        const patch = { status: 'active' };
+                        const patch = { status: 'active', closeReason: null, resolutionBy: null };
                         if (reason !== '') patch.summary = `${node.summary}${node.summary === '' ? '' : '\n'}重开原因：${reason}`;
                         const actor = actorOf(args, exec);
                         const expectedRevision = expectedRevisionOf(args);
@@ -533,15 +564,22 @@ export function buildToolDefinitions(service) {
                         assertLeaseWrite(state, keepId, actor, strict);
                         assertLeaseWrite(state, dropId, actor, strict);
                         const expectedRevision = expectedRevisionOf(args);
+                        const requestedMergeReason = typeof args.closeReason === 'string' ? args.closeReason : 'duplicate';
+                        if (requestedMergeReason !== 'duplicate' && requestedMergeReason !== 'superseded') {
+                            return { ok: false, action, text: `merge 的 closeReason 只能是 duplicate 或 superseded（收到 ${requestedMergeReason}）。` };
+                        }
+                        const mergeReason = requestedMergeReason;
                         await store.apply({
                             t: 'merge',
                             keepId,
                             dropId,
+                            closeReason: mergeReason,
+                            resolutionBy: normalizeResolutionBy(args.resolutionBy, 'auto'),
                             actor: actor ?? undefined,
                             ...(expectedRevision !== undefined ? { expectedRevision } : {}),
                         });
                         await refreshTrunkUp(store, keepId);
-                        return { ok: true, action, id: keepId, text: `已把 ${dropId} 合并进 ${keepId}。` };
+                        return { ok: true, action, id: keepId, text: `已把 ${dropId} 合并进 ${keepId}（${mergeReason}）。` };
                     }
                     case 'promote': {
                         const id = requireString(args.id, 'promote');

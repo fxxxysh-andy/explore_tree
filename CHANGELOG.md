@@ -1,5 +1,157 @@
 # Changelog
 
+## 0.31.0 — 2026-11-05
+
+### 新增（大模型解析 + 设置页 + 简报预算）
+
+- **大模型解析研究轨迹**：新增 `src/core/analyze.js`：`buildAnalysisInput` 把快照压成
+  目标/主干 topic/待办/进行中/死路/最近节点/frontier（默认 12000 字符，超限按
+  recent → deadEnds → doing → frontier → topics → open 裁剪）；`buildAnalysisPrompt` 要求严格 JSON；
+  `parseAnalysisResponse` 容错代码围栏、过滤非法 kind 与不存在的 `nodeIds`。
+- **HTTP 端点**：`GET/POST /explore-tree/analyze?workspace=…`。GET 只读配置与缓存；POST 才调用模型，
+  `force=1` 跳过缓存；Origin 缺失或为回环地址才允许；错误码
+  `analysis_disabled` 403 / `llm_unavailable` 503 / `llm_not_configured` 400 /
+  `workspace_not_found` 404 / `llm_failed`、`analysis_parse_failed` 502。
+- **模型路由与缓存**：新增 `analysis.*` 配置（enabled/provider/model/maxInputChars/timeoutMs/
+  maxOutputTokens/cacheTtlMs）；provider/model 缺省时整对继承 `llm.provider/model`；
+  成功结果按工作区缓存 10 分钟（最多 20 条），并发请求复用 inflight。
+- **概览页 AI 面板**：KPI 后新增只读卡，手动「开始解析/重新解析/重试」；展示 headline、summary、
+  进展/阻塞/风险/洞察 findings 与编号 recommendations，引用节点可点击定位；
+  loading 骨架、未配置/已关闭/失败空态分开；设置页「显示 AI 解析」偏好 `showAnalysis` 控制显示。
+- **设置页改版**：卡片式两列 + 滑动开关（隐藏 checkbox + 轨道），显示/过滤分组，
+  新增全宽「AI 解析」卡（模型路由与 `maxInputChars` 说明），恢复默认仍在底部。
+- **研究脉搏 tooltip 修复**：改为显式深色底、白字、圆角阴影，跟随 hover 点上方/下方翻转并夹在绘图区内，
+  不再用宿主亮色层变量导致白框白字或固定顶部遮挡。
+- **轮首简报上限 400→1200 字符**（约 300 token，`briefMaxChars` 200–4000）：
+  `fitBriefText` 按 `；。，空格` 分句截断；完整简报扩到 6 条 topic/6 条待办叶根/3 条建议；
+  增量简报扩到 6 条新增（前 3 条附摘要）、5 条变化与 2 条「下一步」，无变化仍不注入。
+- **修复**：研究树详情栏关系 tag（如 `continues`）被 flex 挤成竖排；`.et-tag` 加
+  `flex:0 0 auto;white-space:nowrap`。
+- 文档：README §3.1/§3.1.1/§3.4/§6 更新；design 补 v0.31 与 analyze 信任边界；
+  新增 `docs/assets/analysis.png`、`docs/assets/settings.png`，重生成 `docs/assets/overview.png`。
+
+### 验证
+
+- `npm test`：229 项全过（13 suites；新增 analyze 5 项、host analyze 2 项、
+  trunk 预算截断与 delta 富化、client AI 偏好断言）。
+- `node --check lib/client.js`、`node --check src/index.js` 通过。
+- 静态预览用真实快照（1315 节点 / 53 边 / 30 会话）检查概览 AI 面板、tooltip、设置页与研究树布局；
+  概览改为热力/类型两列 + 动态通栏 + 待办/口径两列 + 建议通栏，消除大块行内空白。
+
+## 0.30.0 — 2026-11-05
+
+### 新增（前端改版：概览仪表盘 + 动态跟踪图表）
+
+- **页签拆成「概览 / 研究树」两页**（`state.page`，默认仍为研究树，首帧 loading 契约不变）：
+  顶部改为粘性 hero（品牌 logo、实时同步脉搏、工作区、研究树页的节点/想法/待办/关系 KPI、
+  14 天 sparkline、`刷新`、`右侧栏`），设置页与偏好键完全沿用。
+- **概览仪表盘**（纯 SVG / div，无第三方图库）：
+  - 4 张 KPI 卡：节点总数与近 7 天新增、想法总数、待办（强/弱）、会话与关系/目标；
+  - **研究脉搏**：7 / 30 / 90 天可切，每日新增柱 + 累计节点渐变面积折线，hover 十字准星与数值；
+  - **阶段构成**：六主桶 + 尾桶环形图、完成率进度条；
+  - **活跃热力**：近 8 周热力格 + 次记录 / 峰值每日 / 活跃日 / 连续天，底部图例；
+  - **节点类型**：占比堆叠条 + 带百分比列的横向条形，点击条形只看该类型并跳到研究树页；
+  - **最近动态**：按更新时间取 6 条，点击定位；**待办焦点**、**下一步建议**（frontier）、**记录口径**。
+- **研究树页保留原卡片树**：搜索、轮次 chips、kind 图例、缩放、左侧大纲、右侧详情/概况不变；
+  刷新后新增节点显示 12 秒脉冲光晕，选中路径连线改为流动虚线；工具栏收进 Card 化的三行布局。
+- **新增 pure helpers**：`buildTrend`（按天聚合 createdAt/updatedAt 与累计）、`buildHeatmap`
+  （8 周热力、峰值日、活跃天数与连续天数），仅读 snapshot，不写图。
+- 文档：README §3.3 重写；design §9 补概览页与 hero；新增 `docs/assets/overview.png`（真实快照静态渲染）。
+
+### 验证
+
+- `npm test`：219 项全过（13 suites，client 契约测试未改）；
+  `node --check lib/client.js`、`git diff --check` 通过。
+- 静态预览用真实快照（1303 节点 / 51 边 / 30 会话）渲染概览、研究树、设置页、右侧栏预览，
+  1480px 宽与 900px 设置页截图检查；未发现横向溢出与类名冲突（`.et-row` 与 dashboard 网格已分离为 `.et-dash-row`）。
+
+## 0.29.0 — 2026-11-04
+
+### 新增（P2 旧图结束原因回填）
+
+- **`graph.version` 从 1 升到 2**：`fromJSON` 兼容读取 v1，但旧图在显式迁移前仍保持
+  v1（避免一次普通写入把缺字段的图标成 v2）；新建图直接写 v2，其他版本仍按损坏快照处理。
+- **新增 `src/core/migrate-close-reason.js`**：按标签/标题/kind/status 推断
+  closeReason/resolutionBy，已有字段跳过；提供 plan/apply/validate/revert 纯函数。
+  规则：auto-curated→curated、merged-into→duplicate、工具噪音/中断→aborted、
+  dead_end→dead_end、done 记录类/决策→recorded、done goal/topic→solved、
+  done step/action→completed；自动类写 auto，旧图推断写 migrated。
+- **新增 `scripts/migrate-close-reason.mjs`**：默认 dry-run；`--apply` 先备份再原子写，
+  迁移前后校验 status 计数、关闭节点字段完整、开放节点无字段；`--revert --apply` 只清
+  `resolutionBy=migrated`；检测到 dsh web 时拒绝写回（`--force` 跳过）。
+- **audit-graph**：v2 图对关闭节点缺字段、开放节点带字段报 FAIL；v1 图只提示未回填。
+- **文档**：新增 `docs/schema.md`（磁盘格式、v1/v2 兼容、迁移/回滚）；README/design 同步。
+
+### 验证
+
+- `npm test`：219 项全过（新增 migrate-close-reason 4 项、graph v1→v2 1 项）；
+  `npm run check`、`git diff --check` 通过。
+- 冻结快照（1167 节点）dry-run/apply：回填 898 条，status 仍为 done 632 / active 68 /
+  abandoned 266 / open 201；closeReason 计数 recorded 488、completed 128、aborted 48、
+  duplicate 30、curated 146、dead_end 44、solved 14；校验 ok、重跑 0 变更。
+- 回滚测试：清掉 674 条 migrated，保留 224 条 auto；全为 migrated 的图回到 v1。
+- 未迁移真实工作区、未发布。
+
+## 0.28.0 — 2026-11-04
+
+### 新增（P1 写入端状态原因）
+
+- **Node 增加可选 `closeReason` / `resolutionBy`**：关闭时记录原因
+  （solved / completed / dead_end / superseded / duplicate / curated / aborted / recorded）与结束者
+  （human / auto / migrated）；`open/active` 强制清空，`reopen` 清空，`merge` 默认
+  duplicate + auto。`graph.json` 的 `version` 仍为 1，旧图不加字段。
+- **工具 close 收紧**：question/hypothesis 必须显式 `solved` 或 `dead_end`；其他 kind
+  省略时按类型取默认（goal/topic→solved，step/action→completed，记录类→recorded，
+  dead_end→dead_end）。`add`/`update` 接受两字段；`merge` 可指定 duplicate/superseded。
+- **自动提取**：新增节点按 kind/status 写默认原因；工具失败不再逐条建 dead_end，改为聚合进
+  本轮 step 摘要（最多 20 条、错误截 300 字）；轮次中断不再造「轮次中断」死路，step/action
+  标 abandoned + aborted。
+- **hygiene 收敛**：`planOpenCleanup` 的 abandon 自动写 `closeReason:'curated'`、
+  `resolutionBy:'auto'`。
+- **快照**：`serializeNode` 增加 `resolutionBy`，与 `phase`/`closeReason` 一起供面板显示；
+  旧图缺失字段仍由 `inferCloseReason` 兜底，P0 六主桶计数不变。
+
+### 验证
+
+- `npm test`：214 项 / 13 suites 全过（新增 graph/status/host 的 P1 用例；extract 的
+  「工具失败建 dead_end」断言改为聚合进 step 摘要）。
+- 冻结快照复算：1167 节点仍是待办 184（可见 164、折叠 20；强 38 / 自动 126）、进行中 75、
+  已记录 498、已收束 142、真死路 44；`reconciled=true`。
+- 未迁移旧图、未改 schema 版本、未发布；P2 再做回填。
+
+## 0.27.0 — 2026-11-03
+
+### 新增（P0 状态口径统一，只读）
+
+- **8 种「未决」口径收敛为 6 个主桶 + 4 个尾桶**：新增 `src/core/status.js` 纯函数
+  `phaseOf` / `statusDigest` / `formatDigest`，所有面板与工具共用同一套派生，不再各自
+  按 kind/status 拼数字。1167 节点对账为：待办 184（可见 164、折叠 20；强 38 / 自动 126）、
+  进行中 75、已记录 498、已收束 142（完成 128 + 关闭 14）、真死路 44、已收敛 176
+  （自动收敛 146 + 合并 30）；尾桶另有工具失败 44、中断 4。
+- **快照增加只读展示字段**：`serializeNode` 为每个节点补 `phase` 与 `closeReason`
+  （由 kind + status + 标签派生，不写回 `graph.json`）；`snapshotFor` 新增可选
+  `sessionId`，同时返回会话 digest 与全图 `workspaceDigest`；HTTP
+  `/explore-tree/snapshot` 接受 `session=` / `sessionId=`。
+- **口径接入所有表面**：`overview` / `brief` / `trunk` / `frontier` / 右侧栏预览 /
+  主面板顶栏统一显示「待办 · N · 本会话/全图（共 T；强 S / 自动 W；折叠 H）」；
+  `onlyOpen` 过滤改为按 `phase === 'todo'`，卡片与详情显示语义阶段而非原始 status。
+
+### 修复（点击「研究轨迹」自动弹出右侧栏）
+
+- 删除 `ExploreTreePanel` 内「首次进入会话自动 `openTab`」的 effect，以及
+  `sidebarPreviewAutoOpened` / `sidebarPreviewPending` 全局状态和导航晚到补开逻辑。
+  右侧栏现在只由工具栏「右侧栏」按钮显式打开；插件缺失时按钮保持禁用。
+- `test/unit/client.test.js` 新增 3 个回归用例（挂载/切换会话不弹、导航晚到不补开、
+  插件缺失无副作用），并用旧 bundle 验证回归用例会失败。
+
+### 验证
+
+- `npm test`：210 项 / 13 suites 全过；`npm run check` 通过。
+- 冻结快照复算（1167 节点 / 46 关系）：workspace digest 与报告六主桶逐项一致，
+  `reconciled=true`；临时工作区真实 `snapshotFor` payload 1,130,478 B（每节点
+  `phase`/`closeReason` 增加约 28.5 KB）。
+- 未改 `graph.json` schema，未回填旧节点；P1 才写 `closeReason`/`resolutionBy` 并迁移。
+
 ## 0.26.3 — 2026-11-03
 
 ### 修复（右侧栏「开始」页整页空白）

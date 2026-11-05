@@ -11,7 +11,7 @@
  * @module core/frontier
  */
 import { childrenOf, edgesOf, graphStats, pathToRoot, rootNodes, subtreeIds } from './graph.js';
-import { isAutoCuratedNode } from './hygiene.js';
+import { RESEARCH_KINDS, isTrueDeadEnd } from './status.js';
 
 const TYPE_ORDER = Object.freeze({
     stop: 0,
@@ -63,13 +63,16 @@ export function computeFrontier(state, options = {}) {
         };
     }
 
-    const openNodes = [...state.nodes.values()].filter((node) => node.status === 'open' || node.status === 'active');
+    // 只有研究结论类节点算「待办」；goal/topic/step/action 的 open/active 是结构状态，
+    // 把它们算进来会让 stop 永远触发不了（P0 统一口径）。
+    const openNodes = [...state.nodes.values()].filter((node) => RESEARCH_KINDS.includes(node.kind)
+        && (node.status === 'open' || node.status === 'active'));
     const allNodes = [...state.nodes.values()];
     const hypotheses = allNodes.filter((node) => node.kind === 'hypothesis');
     const unverified = hypotheses.filter((node) => !hasEvidence(state, node.id));
     const conflicted = hypotheses.filter((node) => hasContradiction(state, node.id));
-    const deadEnds = allNodes.filter((node) => (node.kind === 'dead_end' || node.status === 'abandoned')
-        && !isAutoCuratedNode(node));
+    // avoid/revive 只列真研究死路：工具失败、已合并、自动收敛单独折叠，避免把 106 个坑全倒给模型。
+    const deadEnds = allNodes.filter((node) => isTrueDeadEnd(node));
     const conclusions = allNodes.filter((node) => node.kind === 'conclusion');
     const artifacts = allNodes.filter((node) => node.kind === 'artifact');
     const duplicates = duplicateGroups(state);

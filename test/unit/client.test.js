@@ -28,6 +28,9 @@ function loadBundle(options = {}) {
         },
         console,
         fetch: () => Promise.reject(new Error('no network in unit test')),
+        // 面板的自动刷新副作用依赖浏览器定时器；契约测试不需要真的跑 tick。
+        setInterval: () => 0,
+        clearInterval: () => {},
     };
     if (options.localStorage !== undefined) {
         sandbox.localStorage = {
@@ -55,16 +58,80 @@ function findAll(node, predicate, found = []) {
     return found;
 }
 
-function reactStub() {
+function reactStub(options = {}) {
+    const cleanups = [];
     return {
+        Fragment: 'Fragment',
         createElement(type, props, ...children) {
             return { type, props: props ?? {}, children };
         },
         useState(initial) { return [initial, () => {}]; },
-        useEffect() {},
+        useEffect(fn) {
+            // 默认不执行副作用；runEffects 用于断言「挂载本身不打开右侧栏」。
+            if (options.runEffects !== true) return;
+            const cleanup = fn();
+            if (typeof cleanup === 'function') cleanups.push(cleanup);
+        },
         useMemo(fn) { return fn(); },
         useCallback(fn) { return fn; },
         useRef(value) { return { current: value ?? null }; },
+        cleanups,
+    };
+}
+
+function findSidebarButton(tree) {
+    return findAll(tree, (node) => (
+        node.props && node.props.className === 'et-btn'
+        && Array.isArray(node.children) && node.children.includes('右侧栏')
+    ))[0];
+}
+
+// 挂载真实 ExploreTreePanel 的最小运行环境；useEffect 立即执行，才能覆盖
+// 「进入页签自动 openTab」这条旧链路。mode: immediate 导航先就绪 / late 后到 / missing 插件不可用。
+function panelHarness(mode) {
+    const registration = loadBundle();
+    const react = reactStub({ runEffects: true });
+    const module = registration.factory(() => react);
+    const opened = [];
+    const nav = { openTab(kind) { opened.push(kind); } };
+    let viewEntry;
+    let navCallback = null;
+    module.apply({
+        slots: {
+            inject(name, factory) {
+                const entry = factory();
+                if (name === 'conversation.view') viewEntry = entry;
+            },
+            register(options, component) { return { options, component }; },
+        },
+        inject(_deps, callback) {
+            const deps = Array.from(_deps);
+            if (deps.includes('sidebarRight')) {
+                if (mode === 'immediate') callback({ sidebarRight: nav, effect(execute) { return execute(); } });
+                if (mode === 'late') navCallback = callback;
+            }
+            if (deps.includes('sidebarRightTabs')) {
+                callback({ sidebarRightTabs: { register() { return () => {}; } }, effect(execute) { return execute(); } });
+            }
+        },
+    });
+    return {
+        render(props = { sessionId: 's1', useSessions: undefined }) {
+            return viewEntry.component(props);
+        },
+        flushNav() {
+            const callback = navCallback;
+            navCallback = null;
+            if (callback === null) throw new Error('没有待就绪的 sidebarRight 回调');
+            callback({ sidebarRight: nav, effect(execute) { return execute(); } });
+        },
+        opened,
+        cleanup() {
+            while (react.cleanups.length > 0) {
+                const cleanup = react.cleanups.pop();
+                try { cleanup(); } catch (error) { /* 清理失败不影响断言 */ }
+            }
+        },
     };
 }
 
@@ -142,7 +209,7 @@ describe('lib/client.js bundle contract', () => {
         assert.equal(typeof tabs[0].guide[0].title, 'function');
         assert.equal(tabs[0].guide[0].title(), '研究轨迹');
         assert.equal(typeof tabs[0].guide[0].description, 'function');
-        assert.match(tabs[0].guide[0].description(), /目标、未决与下一步/);
+        assert.match(tabs[0].guide[0].description(), /目标、待办与下一步/);
         const preview = injected[2].entry;
         assert.equal(preview.options.name, 'sidebar.right.pane.tab');
         assert.equal(preview.options.key, 'research-tree');
@@ -181,6 +248,55 @@ describe('lib/client.js bundle contract', () => {
         assert.equal(button.props.disabled, false);
         button.props.onClick();
         assert.deepEqual(opened, ['research-tree']);
+    });
+
+    // 回归：旧版首次进入会话的「研究轨迹」页会自动 openTab，用户视为 bug。
+    it('挂载研究轨迹面板不自动打开右侧栏，只有点工具栏按钮才打开', () => {
+        const panel = panelHarness('immediate');
+        try {
+            panel.render({ sessionId: 's1', useSessions: undefined });
+            panel.render({ sessionId: 's2', useSessions: undefined });
+            assert.deepEqual(panel.opened, [], '进入/切换研究轨迹页签都不应打开右侧栏');
+
+            const button = findSidebarButton(panel.render({ sessionId: 's1', useSessions: undefined }));
+            assert.ok(button, '工具栏仍应保留「右侧栏」入口');
+            assert.equal(button.props.disabled, false, '侧栏服务可用时按钮不应禁用');
+            button.props.onClick();
+            assert.deepEqual(panel.opened, ['research-tree'], '只有显式点击才打开右侧栏');
+        } finally {
+            panel.cleanup();
+        }
+    });
+
+    it('侧栏服务晚到时不自动补开；就绪后重新渲染按钮可用', () => {
+        const panel = panelHarness('late');
+        try {
+            const before = findSidebarButton(panel.render({ sessionId: 's1', useSessions: undefined }));
+            assert.equal(before.props.disabled, true, '服务未就绪时按钮禁用');
+            panel.flushNav(); // 旧实现会拿 sidebarPreviewPending 在这里自动补开
+            assert.deepEqual(panel.opened, [], '服务就绪不应自动打开右侧栏');
+
+            const after = findSidebarButton(panel.render({ sessionId: 's1', useSessions: undefined }));
+            assert.equal(after.props.disabled, false, '服务就绪后按钮应变可用');
+            after.props.onClick();
+            assert.deepEqual(panel.opened, ['research-tree']);
+        } finally {
+            panel.cleanup();
+        }
+    });
+
+    it('右侧栏插件不可用时「右侧栏」按钮保持禁用且点击无副作用', () => {
+        const panel = panelHarness('missing');
+        try {
+            const button = findSidebarButton(panel.render({ sessionId: 's1', useSessions: undefined }));
+            assert.ok(button);
+            assert.equal(button.props.disabled, true);
+            assert.equal(button.props.title, '右侧栏插件不可用');
+            button.props.onClick();
+            assert.deepEqual(panel.opened, []);
+        } finally {
+            panel.cleanup();
+        }
     });
 
     it('页签类型 id 已被旧 bundle 占用时仍注册右侧栏 body，不留空白页签', () => {
@@ -258,7 +374,7 @@ describe('lib/client.js bundle contract', () => {
         assert.ok(json.includes('显示选项在 设置 → 研究轨迹'), '面板要提示偏好已移到设置页');
         assert.ok(!json.includes('自动刷新'), '自动刷新已移到设置页，不应再出现在工具栏');
         assert.ok(!json.includes('隐藏动作'), '隐藏动作已移到设置页');
-        assert.ok(!json.includes('只看未决'), '只看未决已移到设置页');
+        assert.ok(!json.includes('只看待办'), '只看待办已移到设置页');
         assert.ok(!json.includes('工作目录路径'), '工作区不再需要手动选择/输入');
         assert.ok(!json.includes('打开'), '不再有路径输入与打开按钮');
     });
@@ -277,7 +393,7 @@ describe('lib/client.js bundle contract', () => {
         });
         const tree = settingsEntry.component({});
         const json = JSON.stringify(tree);
-        for (const text of ['研究轨迹', '显示', '过滤', '自动刷新', '紧凑模式', '大纲', '详情栏', '隐藏动作', '隐藏产物', '隐藏笔记', '只看未决', '仅本会话', '恢复默认']) {
+        for (const text of ['研究轨迹', '显示', '过滤', '自动刷新', '紧凑模式', '大纲', '详情栏', '隐藏动作', '隐藏产物', '隐藏笔记', '只看待办', '仅本会话', 'AI 解析', '显示 AI 解析', '恢复默认']) {
             assert.ok(json.includes(text), '设置页应包含「' + text + '」');
         }
         assert.ok(!json.includes('正在读取研究图'), '设置页不应触发面板请求/加载态');
@@ -310,6 +426,13 @@ describe('lib/client.js bundle contract', () => {
         auto.props.onChange(true);
         assert.equal(JSON.parse(storage.get('explore-tree.prefs.v1')).autoRefresh, true);
         assert.equal(storage.get('explore-tree.prefs.v1.autoRefresh'), 'true');
+
+        const aiToggle = toggle(tree, '显示 AI 解析');
+        assert.equal(aiToggle.props.checked, true, 'AI 解析默认开启');
+        aiToggle.props.onChange(false);
+        tree = settingsEntry.component({});
+        assert.equal(toggle(tree, '显示 AI 解析').props.checked, false);
+        assert.equal(storage.get('explore-tree.prefs.v1.showAnalysis'), 'false', 'AI 解析开关使用单项 key 持久化');
     });
 
     it('两个标签页改不同偏好不互相覆盖，storage 事件会同步', () => {

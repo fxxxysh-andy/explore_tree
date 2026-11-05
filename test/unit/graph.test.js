@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
     addNode,
+    GRAPH_VERSION,
     assignLease,
     childrenOf,
     createGraphState,
@@ -126,6 +127,54 @@ test('linkNodes 去重，mergeNodes 迁移子节点/关系并留占位', () => {
     assert.equal(validateGraph(state).ok, true);
 });
 
+test('P1：closeReason/resolutionBy 写入、重开清空、合并留因并持久化', () => {
+    const state = freshState();
+    const question = addNode(state, { kind: 'question', title: '是否保留缓存？' }, { now: NOW });
+    updateNode(state, question.id, { status: 'done', closeReason: 'solved', resolutionBy: 'human' }, { now: NOW });
+    assert.equal(question.closeReason, 'solved');
+    assert.equal(question.resolutionBy, 'human');
+    updateNode(state, question.id, { status: 'active' }, { now: NOW });
+    assert.equal(question.closeReason, null, '重开必须清掉旧结束原因');
+    assert.equal(question.resolutionBy, null);
+
+    const drop = addNode(state, { kind: 'question', title: '重复问题' }, { now: NOW });
+    mergeNodes(state, question.id, drop.id, { now: NOW });
+    assert.equal(drop.closeReason, 'duplicate');
+    assert.equal(drop.resolutionBy, 'auto');
+    const superseded = addNode(state, { kind: 'question', title: '被替代问题' }, { now: NOW });
+    mergeNodes(state, question.id, superseded.id, { closeReason: 'superseded', now: NOW });
+    assert.equal(superseded.closeReason, 'superseded');
+
+    const stats = graphStats(state);
+    assert.equal(stats.byCloseReason.duplicate, 1);
+    assert.equal(stats.byCloseReason.superseded, 1);
+    assert.equal(stats.byResolution.auto, 2);
+
+    const raw = JSON.parse(JSON.stringify(toJSON(state)));
+    const restored = fromJSON(raw);
+    assert.equal(restored.nodes.get(drop.id).closeReason, 'duplicate');
+    assert.equal(restored.nodes.get(drop.id).resolutionBy, 'auto');
+    // 旧图没有字段时不能因加载而凭空写入。
+    for (const node of Object.values(raw.nodes)) {
+        delete node.closeReason;
+        delete node.resolutionBy;
+    }
+    const old = fromJSON(raw);
+    assert.equal('closeReason' in old.nodes.get(drop.id), false);
+    assert.equal('resolutionBy' in old.nodes.get(drop.id), false);
+});
+
+test('P1：done step 默认 completed，旧图未知原因不误判', () => {
+    const state = freshState();
+    const step = addNode(state, { kind: 'step', title: '已完成轮次', status: 'done' }, { now: NOW });
+    assert.equal(step.closeReason, 'completed');
+    assert.equal(step.resolutionBy, 'auto');
+    const open = addNode(state, { kind: 'question', title: '仍开放', status: 'open', closeReason: 'solved' }, { now: NOW });
+    assert.equal(open.closeReason, null, 'open 节点不能带关闭原因');
+    assert.equal(open.resolutionBy, null);
+    assert.equal(graphStats(state).byCloseReason.completed, 1);
+});
+
 test('removeNode 子节点上移、边删除', () => {
     const state = freshState();
     const a = addNode(state, { kind: 'goal', title: 'A' }, { now: NOW });
@@ -186,4 +235,22 @@ test('graphStats 按 createdBy/updatedBy 给 per-actor 统计', () => {
     const stats = graphStats(state);
     assert.deepEqual(stats.byCreator, { 'agent-a': 2, 'agent-b': 1 });
     assert.deepEqual(stats.byUpdater, { 'agent-a': 2, extractor: 1 });
+});
+
+test('v2：读取 v1 保持 v1，未知版本拒绝', () => {
+    const state = freshState();
+    addNode(state, { kind: 'goal', title: 'G' }, { now: NOW });
+    const raw = JSON.parse(JSON.stringify(toJSON(state)));
+    raw.version = 1;
+    for (const node of Object.values(raw.nodes)) {
+        delete node.closeReason;
+        delete node.resolutionBy;
+    }
+    const restored = fromJSON(raw);
+    assert.equal(restored.version, 1, '旧图保持 v1，等待显式迁移');
+    updateNode(restored, 'n1', { title: 'G2' }, { now: NOW });
+    assert.equal(toJSON(restored).version, 1, '普通写入不能把缺字段的图升成 v2');
+    assert.equal(GRAPH_VERSION, 2, '新建图直接写 v2');
+    raw.version = 3;
+    assert.throws(() => fromJSON(raw), /unsupported graph version: 3/);
 });

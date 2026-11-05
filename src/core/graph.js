@@ -12,22 +12,28 @@
  */
 import {
     clampText,
+    defaultCloseReasonFor,
     MAX_DIGEST,
     MAX_SUMMARY,
     MAX_TITLE,
     normalizeActor,
+    normalizeCloseReason,
     normalizeConfidence,
     normalizeDigestSource,
     normalizeEdgeKind,
     normalizeKind,
     normalizePriority,
     normalizeRefs,
+    normalizeResolutionBy,
     normalizeStatus,
     normalizeTags,
 } from './model.js';
 
-/** 快照格式版本。字段不兼容时升级并写迁移。 */
-export const GRAPH_VERSION = 1;
+/** 快照格式版本。v2 起节点可带 closeReason/resolutionBy（v1 仍可读）。 */
+export const GRAPH_VERSION = 2;
+
+/** 可读的快照版本；v1 在显式迁移前保持 1，新建图写 GRAPH_VERSION。 */
+export const SUPPORTED_GRAPH_VERSIONS = Object.freeze([1, 2]);
 
 /**
  * CAS 冲突：调用方给的 expectedRevision 与节点当前 nodeVersion 不一致。
@@ -185,6 +191,7 @@ export function addNode(state, input, opts = {}) {
         throw new Error(`missing parent node: ${parentId}`);
     }
     const kind = normalizeKind(input.kind);
+    const status = normalizeStatus(input.status, kind === 'conclusion' ? 'done' : 'open');
     const order = Number.isInteger(input.order)
         ? input.order
         : nextSiblingOrder(state, parentId);
@@ -194,7 +201,13 @@ export function addNode(state, input, opts = {}) {
         kind,
         title: clampText(input.title, MAX_TITLE) || `（未命名 ${kind}）`,
         summary: clampText(input.summary, MAX_SUMMARY, { keepNewlines: true }),
-        status: normalizeStatus(input.status, kind === 'conclusion' ? 'done' : 'open'),
+        status,
+        closeReason: status === 'open' || status === 'active'
+            ? null
+            : normalizeCloseReason(input.closeReason, defaultCloseReasonFor(kind, status)),
+        resolutionBy: status === 'open' || status === 'active'
+            ? null
+            : normalizeResolutionBy(input.resolutionBy, 'auto'),
         confidence: normalizeConfidence(input.confidence),
         tags: normalizeTags(input.tags),
         origin: normalizeOrigin(input.origin),
@@ -329,6 +342,19 @@ export function updateNode(state, id, patch, opts = {}) {
         node.summary = clampText(patch.summary, MAX_SUMMARY, { keepNewlines: true });
     }
     if (patch.status !== undefined) node.status = normalizeStatus(patch.status, node.status);
+    if (patch.closeReason !== undefined) node.closeReason = normalizeCloseReason(patch.closeReason);
+    if (patch.resolutionBy !== undefined) node.resolutionBy = normalizeResolutionBy(patch.resolutionBy);
+    // 重新打开时清掉旧结束原因；否则展示层会继续把节点算进「已关闭/死路」。
+    if (node.status === 'open' || node.status === 'active') {
+        node.closeReason = null;
+        node.resolutionBy = null;
+    } else {
+        // P1：只有 status 没有 reason 的旧写法在这里补齐；显式原因永远优先。
+        if (node.closeReason === null || node.closeReason === undefined) {
+            node.closeReason = defaultCloseReasonFor(node.kind, node.status);
+        }
+        if (node.resolutionBy === null || node.resolutionBy === undefined) node.resolutionBy = 'auto';
+    }
     if (patch.confidence !== undefined) node.confidence = normalizeConfidence(patch.confidence);
     if (patch.tags !== undefined) node.tags = normalizeTags(patch.tags);
     if (patch.refs !== undefined) node.refs = normalizeRefs(patch.refs);
@@ -766,6 +792,8 @@ export function mergeNodes(state, keepId, dropId, opts = {}) {
     }
     keep.updatedAt = now;
     drop.status = 'abandoned';
+    drop.closeReason = normalizeCloseReason(opts.closeReason, 'duplicate');
+    drop.resolutionBy = normalizeResolutionBy(opts.resolutionBy, 'auto');
     drop.tags = [...new Set([...drop.tags, 'merged-into'])];
     drop.summary = clampText(`已合并进 ${keepId}。${drop.summary}`, MAX_SUMMARY, { keepNewlines: true });
     drop.updatedAt = now;
@@ -797,12 +825,20 @@ export function removeNode(state, id, opts = {}) {
 export function graphStats(state) {
     const byKind = {};
     const byStatus = {};
+    const byCloseReason = {};
+    const byResolution = {};
     const byCreator = {};
     const byUpdater = {};
     let repeated = 0;
     for (const node of state.nodes.values()) {
         byKind[node.kind] = (byKind[node.kind] ?? 0) + 1;
         byStatus[node.status] = (byStatus[node.status] ?? 0) + 1;
+        if (typeof node.closeReason === 'string' && node.closeReason !== '') {
+            byCloseReason[node.closeReason] = (byCloseReason[node.closeReason] ?? 0) + 1;
+        }
+        if (typeof node.resolutionBy === 'string' && node.resolutionBy !== '') {
+            byResolution[node.resolutionBy] = (byResolution[node.resolutionBy] ?? 0) + 1;
+        }
         const creator = node.createdBy ?? 'unknown';
         const updater = node.updatedBy ?? 'unknown';
         byCreator[creator] = (byCreator[creator] ?? 0) + 1;
@@ -820,6 +856,8 @@ export function graphStats(state) {
         sessions: state.sessions.size,
         byKind,
         byStatus,
+        byCloseReason,
+        byResolution,
         byCreator,
         byUpdater,
         repeated,
@@ -910,7 +948,7 @@ export function toJSON(state) {
 /** 快照 JSON → 内存态。结构不合法时抛错（由 store 决定如何恢复）。 */
 export function fromJSON(raw) {
     if (raw === null || typeof raw !== 'object') throw new Error('graph snapshot is not an object');
-    if (raw.version !== GRAPH_VERSION) {
+    if (!SUPPORTED_GRAPH_VERSIONS.includes(raw.version)) {
         throw new Error(`unsupported graph version: ${String(raw.version)}`);
     }
     if (typeof raw.workspaceRoot !== 'string' || raw.workspaceRoot === '') {
@@ -921,6 +959,8 @@ export function fromJSON(raw) {
         now: typeof raw.updatedAt === 'string' ? raw.updatedAt : nowIso(),
         meta: raw.meta !== null && typeof raw.meta === 'object' ? raw.meta : {},
     });
+    // 旧图保持 v1，直到显式迁移；否则一次普通写入就会把缺字段的图标成 v2。
+    state.version = raw.version;
     state.createdAt = typeof raw.createdAt === 'string' ? raw.createdAt : state.createdAt;
     state.updatedAt = typeof raw.updatedAt === 'string' ? raw.updatedAt : state.updatedAt;
     state.seq = Number.isInteger(raw.seq) ? raw.seq : 0;
@@ -986,6 +1026,9 @@ function sanitizeSnapshotNode(id, raw) {
         title: clampText(raw.title, MAX_TITLE) || `（未命名 ${normalizeKind(raw.kind)}）`,
         summary: clampText(raw.summary, MAX_SUMMARY, { keepNewlines: true }),
         status: normalizeStatus(raw.status),
+        // 旧图没有这两个字段；只有存储里存在时才透传，避免加载即改写全区。
+        ...(normalizeCloseReason(raw.closeReason) !== null ? { closeReason: normalizeCloseReason(raw.closeReason) } : {}),
+        ...(normalizeResolutionBy(raw.resolutionBy) !== null ? { resolutionBy: normalizeResolutionBy(raw.resolutionBy) } : {}),
         confidence: normalizeConfidence(raw.confidence),
         tags: normalizeTags(raw.tags),
         origin: normalizeOrigin(raw.origin),

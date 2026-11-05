@@ -33,7 +33,7 @@ import {
     sessionOf,
 } from './graph.js';
 import { isReasoningNoiseText } from './hygiene.js';
-import { clampText, isLeafRootKind } from './model.js';
+import { clampText, defaultCloseReasonFor, isLeafRootKind } from './model.js';
 import { classifyClaim, isApproachKind, isQuestionText, selectClaims, similarity, splitSentences } from './select.js';
 import { digestBasisOf, topicDigest } from './trunk.js';
 
@@ -159,6 +159,15 @@ const THOUGHT_STATUS = Object.freeze({
     conclusion: 'done',
     note: 'done',
 });
+
+/**
+ * P1：写入时带上「为什么结束」，旧图缺失时仍由 status.js 推断。
+ * 提取器只写自动原因；人工 close 走 host/tools.js 的显式参数。
+ */
+function defaultCloseFields(kind, status) {
+    const closeReason = defaultCloseReasonFor(kind, status);
+    return { closeReason, resolutionBy: closeReason === null ? null : 'auto' };
+}
 
 /**
  * 旁路提取器。
@@ -414,6 +423,7 @@ export class ResearchExtractor {
             runtime.aggActionId = null;
             runtime.activeActionId = null;
             runtime.toolCounts = new Map();
+            runtime.toolFailures = [];
         }
         const session = this.#ensureSession(event);
         const state = this.store.state;
@@ -1287,18 +1297,7 @@ export class ResearchExtractor {
             refs: mergeRefs(action.refs, event),
         });
         if (!ok) {
-            const errorText = clampText(event.error ?? '工具执行失败（无错误信息）', 500, { keepNewlines: true });
-            await this.#addBudgetedNode({
-                parentId: action.id,
-                kind: 'dead_end',
-                title: clampText(`失败：${event.toolName ?? '工具'}`, this.config.maxTitleChars),
-                summary: errorText,
-                status: 'abandoned',
-                origin: 'auto',
-                sessionId: event.sessionId,
-                turn: runtime.turn,
-                fingerprint: fingerprint('auto:deadend', `${event.sessionId}\u0000${runtime.turn}\u0000${normalizeKey(errorText)}`),
-            }, runtime);
+            this.#noteToolFailure(runtime, event, action.id);
             await this.#setSession(event.sessionId, { activeNodeId: action.id });
         }
         if (ok && this.config.captureArtifacts) await this.#recordArtifacts(event, runtime, action.id);
@@ -1349,18 +1348,7 @@ export class ResearchExtractor {
             runtime.aggActionId = node.id;
         }
         if (info.phase === 'end' && info.ok === false) {
-            const errorText = clampText(event.error ?? '工具执行失败（无错误信息）', 500, { keepNewlines: true });
-            await this.#addBudgetedNode({
-                parentId: stepId,
-                kind: 'dead_end',
-                title: clampText(`失败：${event.toolName ?? '工具'}`, this.config.maxTitleChars),
-                summary: errorText,
-                status: 'abandoned',
-                origin: 'auto',
-                sessionId: event.sessionId,
-                turn: runtime.turn,
-                fingerprint: fingerprint('auto:deadend', `${event.sessionId}\u0000${runtime.turn}\u0000${normalizeKey(errorText)}`),
-            }, runtime);
+            this.#noteToolFailure(runtime, event, stepId);
         }
         if (info.phase === 'end' && info.ok !== false && this.config.captureArtifacts) {
             await this.#recordArtifacts(event, runtime, stepId);
@@ -1438,6 +1426,11 @@ export class ResearchExtractor {
             if (event.error !== undefined && event.error !== null) {
                 summary = `${summary}${summary === '' ? '' : '\n'}错误：${clampText(event.error, 500)}`;
             }
+            const failures = runtime.toolFailures ?? [];
+            if (failures.length > 0) {
+                const lines = failures.slice(0, 5).map((item) => `${item.tool}：${item.error.replace(/\s+/g, ' ').slice(0, 120)}`);
+                summary = `${summary}${summary === '' ? '' : '\n'}工具失败 ×${failures.length}（${lines.join('；')}${failures.length > 5 ? ' 等' : ''}）`;
+            }
             const foldedCount = (runtime.foldedNotes?.length ?? 0) + (runtime.narrationCount ?? 0) + (runtime.prunedNoteCount ?? 0);
             if (this.config.selectionStrategy !== 'chronological' && this.config.noteNodeMode === 'fold'
                 && foldedCount > 0 && !summary.includes('过程观察 ×')) {
@@ -1463,19 +1456,6 @@ export class ResearchExtractor {
                         summary: text.summary,
                     });
                 }
-            }
-            if (aborted && event.error !== undefined) {
-                await this.#addBudgetedNode({
-                    parentId: step.id,
-                    kind: 'dead_end',
-                    title: '轮次中断',
-                    summary: clampText(event.error, 500),
-                    status: 'abandoned',
-                    origin: 'auto',
-                    sessionId: event.sessionId,
-                    turn: runtime.turn,
-                    fingerprint: fingerprint('auto:deadend', `${event.sessionId}\u0000${normalizeKey(String(event.error))}`),
-                }, runtime);
             }
         }
         const finalText = clampText(event.text ?? runtime.lastAssistantText ?? '', 4000, { keepNewlines: true });
@@ -1789,6 +1769,7 @@ export class ResearchExtractor {
                 activeActionId: null,
                 aggActionId: null,
                 toolCounts: new Map(),
+                toolFailures: [],
                 autoCount: 0,
                 sawConclusion: false,
                 reasoningChars: 0,
@@ -1837,8 +1818,25 @@ export class ResearchExtractor {
         return session?.activeNodeId ?? null;
     }
 
+    /** 工具失败不逐条建 dead_end：聚合到轮次摘要，避免树里堆满「失败：xxx」。 */
+    #noteToolFailure(runtime, event, targetId) {
+        const list = runtime.toolFailures ?? (runtime.toolFailures = []);
+        if (list.length >= 20) return;
+        list.push({
+            tool: event.toolName ?? '工具',
+            error: clampText(event.error ?? '工具执行失败（无错误信息）', 300, { keepNewlines: true }),
+            targetId: targetId ?? null,
+        });
+    }
+
     async #addNode(input) {
-        const op = await this.store.apply({ t: 'addNode', actor: this.actor, node: input });
+        const node = { ...input };
+        if (node.status !== undefined && (node.closeReason === undefined || node.resolutionBy === undefined)) {
+            const defaults = defaultCloseFields(node.kind, node.status);
+            if (node.closeReason === undefined) node.closeReason = defaults.closeReason;
+            if (node.resolutionBy === undefined) node.resolutionBy = defaults.resolutionBy;
+        }
+        const op = await this.store.apply({ t: 'addNode', actor: this.actor, node });
         return op.node;
     }
 
@@ -1889,8 +1887,15 @@ export class ResearchExtractor {
 
     async #updateNode(id, patch) {
         const state = this.store.state;
-        if (!state.nodes.has(id)) return null;
-        const op = await this.store.apply({ t: 'updateNode', id, patch, actor: this.actor });
+        const current = state.nodes.get(id);
+        if (current === undefined) return null;
+        const next = { ...patch };
+        if (next.status !== undefined && (next.closeReason === undefined || next.resolutionBy === undefined)) {
+            const defaults = defaultCloseFields(next.kind ?? current.kind, next.status);
+            if (next.closeReason === undefined) next.closeReason = defaults.closeReason;
+            if (next.resolutionBy === undefined) next.resolutionBy = defaults.resolutionBy;
+        }
+        const op = await this.store.apply({ t: 'updateNode', id, patch: next, actor: this.actor });
         return op;
     }
 

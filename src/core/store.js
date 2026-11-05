@@ -310,6 +310,8 @@ export class WorkspaceGraphStore extends EventEmitter {
                     now: op.at,
                     actor: op.actor,
                     expectedRevision: op.expectedRevision,
+                    closeReason: op.closeReason,
+                    resolutionBy: op.resolutionBy,
                 });
                 break;
             case 'remove':

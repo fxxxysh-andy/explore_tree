@@ -295,6 +295,8 @@ export function planOpenCleanup(state, options = {}) {
             kind: node.kind,
             title: node.title,
             status: 'abandoned',
+            closeReason: 'curated',
+            resolutionBy: 'auto',
             tags,
             summary: `${summary === '' ? '' : `${summary}\n\n`}自动收敛：${classification.reason}`,
             reason: classification.reason,

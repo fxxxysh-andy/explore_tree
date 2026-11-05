@@ -17,11 +17,13 @@ import { canonicalWorkspaceRoot, workspaceName } from '../core/paths.js';
 import { graphStats } from '../core/graph.js';
 import { computeFrontier } from '../core/frontier.js';
 import { collectOpenItems } from '../core/hygiene.js';
+import { inferCloseReason, phaseOf, statusDigest } from '../core/status.js';
 import { ResearchExtractor, classifySectionKind, splitAnswerSections } from '../core/extract.js';
 import { fingerprint, normalizeKey } from '../core/fingerprint.js';
 import { renderBrief, renderBriefDelta, snapshotBriefState } from '../core/trunk.js';
 import { extractConfigOf } from './config.js';
-import { extractClaimsWithLlm, summarizeTopicWithLlm } from './llm.js';
+import { callLlmText, extractClaimsWithLlm, summarizeTopicWithLlm } from './llm.js';
+import { ANALYSIS_SYSTEM_PROMPT, buildAnalysisInput, buildAnalysisPrompt, parseAnalysisResponse } from '../core/analyze.js';
 import { finishSession, translateSessionEvent } from './translate.js';
 
 const LOOPBACK_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1', 'localhost']);
@@ -41,6 +43,28 @@ function isLoopback(req) {
     return LOOPBACK_ADDRESSES.has(address);
 }
 
+/** 浏览器跨站请求会带 Origin；只接受本机页面，避免任意网页触发付费模型调用。 */
+function isTrustedOrigin(req) {
+    const origin = req?.headers?.origin;
+    if (typeof origin !== 'string' || origin === '') return true;
+    try {
+        const url = new URL(origin);
+        return LOOPBACK_ADDRESSES.has(url.hostname) || url.hostname === '[::1]';
+    } catch {
+        return false;
+    }
+}
+
+/** 解析接口的显式错误：带 HTTP 状态与稳定 code，面板直接展示 message。 */
+class AnalysisError extends Error {
+    constructor(message, status = 400, code = 'analysis_error') {
+        super(message);
+        this.name = 'AnalysisError';
+        this.status = status;
+        this.code = code;
+    }
+}
+
 function clipSummary(text, max = 2000) {
     if (typeof text !== 'string') return '';
     return text.length <= max ? text : `${text.slice(0, max)}\n…[截断]`;
@@ -55,6 +79,9 @@ function serializeNode(node) {
         title: node.title,
         summary: clipSummary(node.summary),
         status: node.status,
+        phase: phaseOf(node),
+        closeReason: inferCloseReason(node),
+        resolutionBy: node.resolutionBy ?? null,
         confidence: node.confidence ?? null,
         tags: Array.isArray(node.tags) ? node.tags : [],
         origin: node.origin ?? 'auto',
@@ -123,6 +150,10 @@ export class ResearchTraceService {
         this.briefSnapshots = new Map();
         /** compaction/end 后强制补一次完整简报。 */
         this.briefForced = new Set();
+        /** root(lowercase) → {at:number, result:object} 研究图解析缓存。 */
+        this.analysisCache = new Map();
+        /** root(lowercase) → Promise，合并并发请求，避免重复扣费。 */
+        this.analysisInflight = new Map();
     }
 
     /**
@@ -196,6 +227,120 @@ export class ResearchTraceService {
             topic: { title: payload.title },
             children: payload.children ?? [],
         });
+    }
+
+    // ───────────────────── 研究图解析（手动触发，独立于自动提取） ─────────────────────
+
+    /** analysis 配置与 llm 路由的合并视图；analysis 自己配了 provider/model 就成对使用。 */
+    analysisSettings() {
+        const own = this.config.analysis ?? {};
+        const llm = this.config.llm ?? {};
+        const selfConfigured = (typeof own.provider === 'string' && own.provider !== '')
+            || (typeof own.model === 'string' && own.model !== '');
+        const provider = selfConfigured ? own.provider : llm.provider;
+        const model = selfConfigured ? own.model : llm.model;
+        return {
+            enabled: own.enabled !== false,
+            provider: typeof provider === 'string' && provider !== '' ? provider : undefined,
+            model: typeof model === 'string' && model !== '' ? model : undefined,
+            maxInputChars: Number.isFinite(own.maxInputChars) ? own.maxInputChars : 12000,
+            timeoutMs: Number.isFinite(own.timeoutMs) ? own.timeoutMs : 60000,
+            maxOutputTokens: Number.isFinite(own.maxOutputTokens) ? own.maxOutputTokens : 1600,
+            cacheTtlMs: Number.isFinite(own.cacheTtlMs) ? own.cacheTtlMs : 600000,
+        };
+    }
+
+    /** GET 状态：只读配置与缓存，不触发模型调用。 */
+    getAnalysisInfo(root) {
+        const settings = this.analysisSettings();
+        const key = (canonicalWorkspaceRoot(root) ?? root).toLowerCase();
+        const cached = this.analysisCache.get(key);
+        return {
+            enabled: settings.enabled,
+            configured: settings.provider !== undefined && settings.model !== undefined,
+            provider: settings.provider ?? null,
+            model: settings.model ?? null,
+            cachedAt: cached !== undefined ? new Date(cached.at).toISOString() : null,
+            analysis: cached !== undefined ? cached.result.analysis : null,
+            meta: cached !== undefined ? { ...cached.result.meta, cached: true } : null,
+        };
+    }
+
+    /**
+     * 生成（或复用缓存）研究图解析。force=true 时跳过缓存。
+     * 并发请求合并到同一个 Promise；错误统一抛 AnalysisError。
+     */
+    async analyzeWorkspace(root, options = {}) {
+        const settings = this.analysisSettings();
+        if (!settings.enabled) {
+            throw new AnalysisError('AI 解析已在插件配置中关闭（analysis.enabled: false）', 403, 'analysis_disabled');
+        }
+        if (this.llmRuntime === null || typeof this.llmRuntime !== 'object' || typeof this.llmRuntime.prepareCall !== 'function') {
+            throw new AnalysisError('宿主未注入可用的 llm 服务，无法解析研究图', 503, 'llm_unavailable');
+        }
+        if (settings.provider === undefined || settings.model === undefined) {
+            throw new AnalysisError('未配置大模型路由：请在插件配置中填写 analysis.provider / analysis.model（也可沿用 llm.provider / llm.model）', 400, 'llm_not_configured');
+        }
+        const canonical = canonicalWorkspaceRoot(root) ?? root;
+        if (!(await this.allowsRoot(canonical))) {
+            throw new AnalysisError('workspace not found or not allowed', 404, 'workspace_not_found');
+        }
+        const key = canonical.toLowerCase();
+        const cached = this.analysisCache.get(key);
+        if (options.force !== true && cached !== undefined && settings.cacheTtlMs > 0 && Date.now() - cached.at < settings.cacheTtlMs) {
+            return { analysis: cached.result.analysis, meta: { ...cached.result.meta, cached: true } };
+        }
+        const inflight = this.analysisInflight.get(key);
+        if (inflight !== undefined) return inflight;
+        const task = this.#runAnalysis(canonical, settings).finally(() => {
+            this.analysisInflight.delete(key);
+        });
+        this.analysisInflight.set(key, task);
+        return task;
+    }
+
+    async #runAnalysis(root, settings) {
+        const started = Date.now();
+        const snapshot = await this.snapshotFor(root);
+        const input = buildAnalysisInput(snapshot, { maxInputChars: settings.maxInputChars });
+        const prompt = buildAnalysisPrompt(input, { maxInputChars: settings.maxInputChars });
+        let text;
+        try {
+            text = await callLlmText({
+                llm: this.llmRuntime,
+                provider: settings.provider,
+                model: settings.model,
+                prompt,
+                system: ANALYSIS_SYSTEM_PROMPT,
+                maxTokens: settings.maxOutputTokens,
+                timeoutMs: settings.timeoutMs,
+                purpose: 'explore-tree-analysis',
+            });
+        } catch (error) {
+            throw new AnalysisError('模型调用失败：' + (error instanceof Error ? error.message : String(error)), 502, 'llm_failed');
+        }
+        const known = new Set((Array.isArray(snapshot.nodes) ? snapshot.nodes : []).map((node) => node.id));
+        const analysis = parseAnalysisResponse(text, { nodeIds: known });
+        if (analysis === null) {
+            throw new AnalysisError('模型返回的内容无法解析为分析 JSON，请重试或换一个模型', 502, 'analysis_parse_failed');
+        }
+        const meta = {
+            provider: settings.provider,
+            model: settings.model,
+            generatedAt: new Date().toISOString(),
+            cached: false,
+            nodeCount: Array.isArray(snapshot.nodes) ? snapshot.nodes.length : 0,
+            tookMs: Date.now() - started,
+            inputChars: prompt.length,
+        };
+        const result = { analysis, meta };
+        this.analysisCache.set(root.toLowerCase(), { at: Date.now(), result });
+        while (this.analysisCache.size > 20) {
+            const oldest = this.analysisCache.keys().next().value;
+            if (oldest === undefined) break;
+            this.analysisCache.delete(oldest);
+        }
+        return result;
     }
 
     // ───────────────────────── 工作区解析 ─────────────────────────
@@ -599,9 +744,10 @@ export class ResearchTraceService {
         if (!hasGoal) return null;
         const sessionId = typeof session.id === 'string' ? session.id : null;
         const previous = options.previous instanceof Map ? options.previous : null;
+        const maxChars = this.config.briefMaxChars;
         const text = options.full === true || previous === null
-            ? renderBrief(state, { sessionId, limit: 3, scope: this.config.briefScope })
-            : renderBriefDelta(state, previous, { sessionId });
+            ? renderBrief(state, { sessionId, limit: 3, scope: this.config.briefScope, maxChars })
+            : renderBriefDelta(state, previous, { sessionId, maxChars });
         return { text, snapshot: snapshotBriefState(state) };
     }
 
@@ -667,19 +813,34 @@ export class ResearchTraceService {
         const focusId = typeof options.focusId === 'string' && state.nodes.has(options.focusId)
             ? options.focusId
             : this.pickFocus(state);
-        const frontier = computeFrontier(state, { focusId, limit: options.limit ?? 6 });
-        const open = collectOpenItems(state, { limit: 8 });
+        const sessionId = typeof options.sessionId === 'string' && options.sessionId !== '' ? options.sessionId : null;
+        const frontier = computeFrontier(state, { focusId, limit: options.limit ?? 6, sessionId });
+        const digest = statusDigest(state, { sessionId });
+        const workspaceDigest = sessionId === null ? digest : statusDigest(state);
+        const open = collectOpenItems(state, { sessionId: sessionId ?? undefined, limit: 8 });
         const stats = graphStats(state);
         return {
             ok: true,
             generatedAt: new Date().toISOString(),
             workspace: { root: store.root, name: workspaceName(store.root) },
             focus: focusId,
-            stats: { ...stats, openUnresolved: open.visibleCount, openHidden: open.hiddenCount },
+            stats: {
+                ...stats,
+                openUnresolved: digest.todo.visible,
+                openHidden: digest.todo.hidden,
+                openTotal: digest.todo.total,
+                openStrong: digest.todo.strong,
+                openWeak: digest.todo.weak,
+            },
+            digest,
+            workspaceDigest,
             open: {
-                total: open.total,
-                visibleCount: open.visibleCount,
-                hiddenCount: open.hiddenCount,
+                scope: digest.scope,
+                total: digest.todo.total,
+                visibleCount: digest.todo.visible,
+                hiddenCount: digest.todo.hidden,
+                strongCount: digest.todo.strong,
+                weakCount: digest.todo.weak,
                 noiseCount: open.noiseCount,
                 staleCount: open.staleCount,
                 detailCount: open.detailCount,
@@ -812,12 +973,51 @@ export class ResearchTraceService {
                 sendJson(res, 403, { ok: false, error: 'forbidden: explore-tree 只接受本机请求' });
                 return;
             }
+            const url = new URL(req.url ?? '/', 'http://localhost');
+            const pathname = url.pathname.replace(/\/+$/u, '');
+            if (pathname === '/explore-tree/analyze') {
+                if (!isTrustedOrigin(req)) {
+                    sendJson(res, 403, { ok: false, error: 'forbidden origin' });
+                    return;
+                }
+                const requested = url.searchParams.get('workspace');
+                if (requested === null || requested === '') {
+                    sendJson(res, 400, { ok: false, error: 'workspace is required' });
+                    return;
+                }
+                if (req.method === 'POST') {
+                    if (!(await this.allowsRoot(requested))) {
+                        sendJson(res, 404, { ok: false, error: 'workspace not found or not allowed' });
+                        return;
+                    }
+                    const forceParam = url.searchParams.get('force');
+                    try {
+                        const result = await this.analyzeWorkspace(requested, { force: forceParam === '1' || forceParam === 'true' });
+                        sendJson(res, 200, { ok: true, ...result });
+                    } catch (error) {
+                        if (error instanceof AnalysisError) {
+                            sendJson(res, error.status, { ok: false, error: error.message, code: error.code });
+                            return;
+                        }
+                        throw error;
+                    }
+                    return;
+                }
+                if (req.method === 'GET') {
+                    if (!(await this.allowsRoot(requested))) {
+                        sendJson(res, 404, { ok: false, error: 'workspace not found or not allowed' });
+                        return;
+                    }
+                    sendJson(res, 200, { ok: true, ...this.getAnalysisInfo(requested) });
+                    return;
+                }
+                sendJson(res, 405, { ok: false, error: 'method not allowed' });
+                return;
+            }
             if (req.method !== 'GET') {
                 sendJson(res, 405, { ok: false, error: 'method not allowed' });
                 return;
             }
-            const url = new URL(req.url ?? '/', 'http://localhost');
-            const pathname = url.pathname.replace(/\/+$/u, '');
             if (pathname === '/explore-tree/workspaces') {
                 sendJson(res, 200, { ok: true, workspaces: await this.listWorkspaces() });
                 return;
@@ -841,7 +1041,8 @@ export class ResearchTraceService {
                     return;
                 }
                 const focus = url.searchParams.get('focus');
-                sendJson(res, 200, await this.snapshotFor(root, { focusId: focus ?? undefined }));
+                const sessionId = url.searchParams.get('session') ?? url.searchParams.get('sessionId');
+                sendJson(res, 200, await this.snapshotFor(root, { focusId: focus ?? undefined, sessionId: sessionId ?? undefined }));
                 return;
             }
             if (pathname === '/explore-tree/health') {
@@ -868,6 +1069,8 @@ export class ResearchTraceService {
         this.briefInjections.clear();
         this.briefSnapshots.clear();
         this.briefForced.clear();
+        this.analysisCache.clear();
+        this.analysisInflight.clear();
     }
 }
 

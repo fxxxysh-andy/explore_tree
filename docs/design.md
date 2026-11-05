@@ -54,6 +54,7 @@
 23└───────────────▲─────────────────────────────────────────────────────────────┘
                                        │ GET /explore-tree/workspaces
                                        │ GET /explore-tree/snapshot?workspace=…
+│ GET/POST /explore-tree/analyze?workspace=…
 ┌──────────────── DSH Host 进程 ──────┴───────────────────────────────────────────┐
 │ explore-tree 插件（src/index.js）                                                 │
 │  ┌────────────────────┐  会话事件（旁路）   ┌────────────────────┐               │
@@ -116,6 +117,8 @@
   "title": "一句话标题（<=120 字）",
   "summary": "摘要（换行保留，<=8000 字）",
   "status": "open",               // open|active|done|abandoned；conclusion 默认 done
+  "closeReason": null,            // 可选：solved|completed|dead_end|superseded|duplicate|curated|aborted|recorded；open/active 时为空
+  "resolutionBy": null,           // 可选：human|auto|migrated；open/active 时为空
   "confidence": null,             // 0..1 两位小数
   "tags": ["web", "unverified"],
   "origin": "auto",               // auto|model|user
@@ -142,6 +145,8 @@
   "auto": { "rule": "tool-call" } // 诊断信息（可选）
 }
 ```
+
+`closeReason`/`resolutionBy` 是 P1 的写入端元数据：关闭时记录「为什么结束」与「谁结束的」，`open/active` 时强制为空，`reopen` 会清空。旧图缺失时由 `src/core/status.js` 的 `inferCloseReason` 按 kind/status/标签兜底，因此 P0 的六主桶计数不变。P2 用 `scripts/migrate-close-reason.mjs` 给旧图回填，只加字段、不改 status，schema 版本升到 2；完整格式与迁移/回滚见 [`docs/schema.md`](./schema.md)。
 
 `kind` 语义：`goal` 目标/用户请求；`topic` 摘要主干（父节点是子节点摘要的摘要，v0.13）；`question` 子问题；`hypothesis` 可验证假设；
 `step` 一轮研究活动（reasoning 摘要放这里）；`action` 一次工具动作；`evidence` 证据；
@@ -171,7 +176,7 @@ v0.24 起，主题还必须与当前用户意图相关（`topicIntentThreshold`�
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,                         // schema 版本；v1 仍可读，见 docs/schema.md
   "workspaceRoot": "D:\\…",
   "createdAt": "…", "updatedAt": "…",
   "seq": 42,                       // 下一个节点号
@@ -409,15 +414,45 @@ Fine/Plan/好的/完成 等泛化标题。
     注册，缺少右栏插件时不影响主面板。201 项单测（host Team 读取 1 项 + client 右侧栏注册 1 项）。
   - **v0.26.1**：右侧栏预览补显式入口：主面板工具栏「右侧栏」按钮调用
     `sidebarRight.openTab('research-tree')`；首次进入某会话的研究轨迹页自动展开一次，
-    关掉后不再强制。可选注入扩为 `sidebarRightTabs + sidebarRight`，缺 `openTab` 仅禁用按钮。
+    关掉后不再强制（v0.27 起移除自动展开，只保留按钮）。可选注入扩为
+    `sidebarRightTabs + sidebarRight`，缺 `openTab` 仅禁用按钮。
     202 项单测（client 9 项，新增按钮调用）。
   - **v0.26.2**：右侧栏注册拆分：`sidebarRightTabs`（页签类型 + body）与
     `sidebarRight`（导航）分别 `ctx.inject`；body 先注册，重复 tab id 只保留旧定义。
-    导航晚到通过 `sidebarPreviewPending` 补开一次。203 项单测（client 10 项，新增重复 id 仍有 body）。
+    导航晚到通过 `sidebarPreviewPending` 补开一次（v0.27 起移除该补开逻辑）。
+    203 项单测（client 10 项，新增重复 id 仍有 body）。
   - **v0.26.3**：修复右侧栏 guide 整页空白——`guide` 条目的 `title`/`description` 必须是
     函数（宿主 `GuideBody` 直接调用），v0.26.0–v0.26.2 写成字符串会抛
     `TypeError: entry.title is not a function`，并连带挡住 better-sidebar 的卡片；
     client 用例锁住函数契约。
+  - **v0.27.0**：P0 状态口径统一 + 右侧栏误弹修复。新增只读 `src/core/status.js`：
+    `phaseOf` / `statusDigest` / `formatDigest` 把原来的 8 种「未决」口径统一成
+    6 个主桶（待办 / 进行中 / 已记录 / 已收束 / 死路 / 收敛）+ 4 个尾桶（自动收敛 /
+    已合并 / 工具失败 / 中断），不写图、不加字段。`snapshot` 为每个节点补
+    `phase` / `closeReason`，所有面板/工具共用同一派生；右侧栏去掉「首次进入会话自动
+    openTab」effect 与 `sidebarPreviewPending` 补开，只保留工具栏按钮显式打开。
+    210 项单测（新增 status 4 项、client 右侧栏回归 3 项）。
+  - **v0.28.0**：P1 写入端原因。Node 新增可选 `closeReason` / `resolutionBy`，关闭时写清
+    solved/completed/dead_end/superseded/duplicate/curated/aborted/recorded 与 human/auto/migrated；
+    `open/active` 强制清空，`reopen` 清空，`merge` 默认 duplicate+auto。工具 close 对
+    question/hypothesis 强制显式原因；自动提取改为默认原因 + 工具失败聚合成 step 摘要（不再逐条造
+    dead_end），hygiene 收敛写 curated+auto。旧图不加字段、由 `inferCloseReason` 兜底；214 项单测。
+  - **v0.29.0**：P2 旧图回填。`GRAPH_VERSION` 升到 2，`fromJSON` 兼容读取 v1；
+    新增 `src/core/migrate-close-reason.js` 与 `scripts/migrate-close-reason.mjs`：
+    已有 closeReason 跳过、只补缺失字段、迁移前后校验 status 计数、--apply 备份并原子写、
+    --revert 只清 resolutionBy=migrated。冻结快照 1167 节点的 898 个关闭节点全部回填
+    （实际图已有字段的节点会跳过），六主桶与 status 计数不变。新增 `docs/schema.md`。
+   - **v0.30.0**：前端改版。页签拆「概览 / 研究树」两页（默认研究树），粘性 hero 汇总品牌、
+     实时同步、工作区、KPI、14 天 sparkline、刷新与右侧栏入口；新增只读概览仪表盘：KPI 卡、
+     研究脉搏（7/30/90 天柱 + 累计面积）、阶段环形图 + 完成率、8 周活跃热力、节点类型堆叠条/条形
+     （点击过滤并跳树页）、最近动态、待办焦点、frontier 建议与记录口径。新增 `buildTrend` /
+     `buildHeatmap` 纯函数；卡片树新增新节点 12 秒脉冲与选中路径流动虚线。无新依赖，
+     219 项单测与 client 契约不变。
+   - **v0.31.0**：大模型解析 + 设置页 + 简报预算。新增 `src/core/analyze.js`（压图/严格 JSON
+     提示词/容错解析）、`POST|GET /explore-tree/analyze`、`analysis.*` 配置与 10 分钟按工作区缓存；
+     概览页 AI 面板手动触发、引用节点可定位；设置页改卡片两列 + 滑动开关 + AI 全宽卡；
+     研究脉搏 tooltip 改显式深色并贴 hover 点；轮首简报上限 400→1200 字符（`briefMaxChars`，
+     按分句预算截断，增量含摘要与下一步）；关系 tag 不再竖排。229 项单测。
   - 未做：多 agent 对照实验（H4 协议已预注册）；自动提取仍不启用租约写域（只做归属，不阻断）。
 
 ### 6.5 归档与摘要版本（v0.17）
@@ -474,19 +509,21 @@ Fine/Plan/好的/完成 等泛化标题。
   顶栏常驻按钮或 `shell.overlay` 弹层（用户反馈：顶栏按钮冗余且不解决图空白）。
 - 右侧栏预览（v0.26）：可选注入 `sidebarRightTabs`（页签类型 + body）与 `sidebarRight`（导航），注册 tab
   `research-tree`（title「研究轨迹」、keepMounted、guide 条目）；body 用标准 props 的
-  `sessionId/useSessions` 绑定会话工作区，读 snapshot 显示目标、计数、未决前 3（details 展开摘要）
+  `sessionId/useSessions` 绑定会话工作区，读 snapshot 显示目标、计数、待办前 3（details 展开摘要）
   与第一条 frontier 建议，底部提示完整视图在会话页签。没有右侧栏插件时不注册。
-- 入口（v0.26.1）：tab 类型只贡献 guide 卡片，右栏收起时用户看不到；`ExploreTreePanel`
-  首次挂载时按 `sessionId` 自动 `openTab('research-tree')` 一次，工具栏「右侧栏」按钮
-  可随时重开（`disabled` 当宿主没有 `openTab`）。v0.26.2 把 body 注册提到类型注册之前，
-  导航服务后到时用 `sidebarPreviewPending` 补开，避免 HMR/旧 bundle 占 id 留下空白页签。
+- 入口（v0.26.1，v0.27 起变更）：tab 类型只贡献 guide 卡片，右栏收起时用户看不到；用户通过
+  主面板工具栏「右侧栏」按钮显式 `openTab('research-tree')`（`disabled` 当宿主没有
+  `openTab`）。`ExploreTreePanel` 挂载、切换会话、导航服务晚到都不再自动弹出右侧栏。
+  v0.26.2 把 body 注册提到类型注册之前，避免 HMR/旧 bundle 占 id 留下空白页签。
 - 面板（v0.10）：
-  - 轮首简报注入（v0.22 增量）：`agent/pre-step` 追加一条 `source.kind=explore-tree-context` 的 user 消息
-    （≤400 字：目标/主干 digest/其他主干/未决叶根/主干建议），同一轮最多一次，`compaction/end` 后强制补一次；
+  - 轮首简报注入（v0.22 增量，v0.31 扩预算）：`agent/pre-step` 追加一条 `source.kind=explore-tree-context`
+    的 user 消息（默认 ≤1200 字，约 300 token：目标/主干 digest/其他主干/未决叶根/主干建议；
+    `briefMaxChars` 200–4000，按分句预算截断），同一轮最多一次，`compaction/end` 后强制补一次；
     `injectBrief=false` 可关。会话已有 goal 即启用（不再要求先有 topic）。service 在首次注入时保存
     `snapshotBriefState`（节点 id/kind/title/status/parentId/updatedAt），之后只渲染 `renderBriefDelta`：
-    新增关键节点（conclusion/decision/dead_end/topic/artifact 优先，最多 3 条）、完成/放弃、标题或父节点变化、
-    合并/移除；step/action 等结构节点的状态变化不计入。树没有值得说的变化时返回空串并跳过注入，
+    新增关键节点（conclusion/decision/dead_end/topic/artifact 优先，最多 6 条，前 3 条附摘要）、
+    完成/放弃、标题或父节点变化、合并/移除（最多 5 条），末尾附 2 条 frontier「下一步」；
+    step/action 等结构节点的状态变化不计入。树没有值得说的变化时返回空串并跳过注入，
     但该轮已标记检查；只有真正注入才更新快照，变化不会丢，下一次照样进增量。
     `briefScope` 默认 `workspace`：额外列「其他主干：…」（同工作区其他 goal 的 topic + digest/owner），
     让多 agent 看到共享主干；`goal` 保留旧的单 goal 视图。
@@ -496,10 +533,24 @@ Fine/Plan/好的/完成 等泛化标题。
   - 工具栏：①标题、工作区、节点/想法/未决/关系/层深统计 + `折叠` `展开` `适应宽度` `最新`、
     缩放组（20%–160%）与 `刷新`，并提示「显示选项在 设置 → 研究轨迹」；②搜索（标题/摘要/标签，`下一个` 自动展开祖先）+
     轮次 chips（`第 N 轮 · 子节点数`）与按 kind 的图例计数。
-  - 设置页「研究轨迹」分区（`settings.section`，id `explore-tree`，order 518）：显示组 `autoRefresh`
-    `compact` `showOutline` `showInspector`，过滤组 `hideActions` `hideArtifacts` `hideNotes`
-    `onlyOpen` `onlySession`；偏好存 `localStorage` 的 `explore-tree.prefs.v1`，面板与设置页通过订阅实时同步，
-    其他标签页改动由 `storage` 事件跟进；「恢复默认」只重置偏好、不碰图数据。
+  - 概览页（v0.30）：`state.page` 切「概览 / 研究树」，默认仍是研究树（loading 首帧契约不变）。
+    hero 常驻品牌/实时同步/工作区，研究树页额外显示 4 个 KPI 与 14 天 sparkline；`刷新`、`右侧栏` 也收进 hero。
+    概览是只读仪表盘：KPI 卡、研究脉搏（`buildTrend`，7/30/90 天，柱 + 累计面积 + hover 准星）、
+    阶段构成（环形 + 完成率进度条）、活跃热力（`buildHeatmap`，8 周 + 峰值/活跃/连续天数 + 图例）、
+    节点类型（占比堆叠条 + 条形，点击 `filterKindAndOpen` 只看该类型并跳回树页）、最近动态（6 条，
+    `openNode` 定位）、待办焦点、frontier 下一步建议与记录口径。全部纯 SVG/div，无第三方图库；
+    研究树刷新时新增节点带 12 秒 `freshIds` 脉冲，选中路径连线为流动虚线。CSS 全量重写但沿用旧类名，
+    dashboard 行用新增的 `.et-dash-row`（避免覆盖详情栏的 `.et-row`）。
+    概览 AI（v0.31）：KPI 后是手动触发的「AI 解析」面板，`AnalysisPanel` 读
+    `GET /explore-tree/analyze` 的配置/缓存，点击后 `POST`（`force=1` 重新解析）；服务端
+    `buildAnalysisInput` 压图、`buildAnalysisPrompt` 要求严格 JSON、`parseAnalysisResponse`
+    容错并过滤未知 `nodeIds`；缓存按工作区 10 分钟、并发复用 inflight。输入不含 reasoning 原文，
+    结果只进面板与内存缓存，不写图。
+  - 设置页「研究轨迹」分区（`settings.section`，id `explore-tree`，order 518）：v0.31 起为卡片式两列，
+    显示组 `autoRefresh` `compact` `showOutline` `showInspector` `showAnalysis`，过滤组 `hideActions`
+    `hideArtifacts` `hideNotes` `onlyOpen` `onlySession`；开关为隐藏 checkbox + 轨道滑块，
+    「AI 解析」全宽卡显示模型路由与 `maxInputChars`；偏好存 `localStorage` 的 `explore-tree.prefs.v1`，
+    面板与设置页通过订阅实时同步，其他标签页改动由 `storage` 事件跟进；「恢复默认」只重置偏好、不碰图数据。
 - 详情栏长摘要默认折叠为「摘要 + 展开全文 · N 字」；LLM 节点卡片带 `AI` 标记。
 - 左：**大纲**（目标 + 每轮标题与子树计数，点击定位，可在设置页关闭）。中：自上而下的**卡片树**（父卡在上、
     子卡在下，贝塞尔连线，选中路径高亮；卡片含 kind 徽标、标题、摘要、状态、**子树统计**与折叠按钮）。
@@ -520,13 +571,14 @@ Fine/Plan/好的/完成 等泛化标题。
 - 默认隐藏 `action` 节点（旧图里有几百个）；旧图 `note`（P0/P1 前的 process 旁白）也默认折叠，
   可在设置页取消「隐藏笔记」。可见子节点就近挂到未隐藏祖先，不破坏树形。
 - 首帧在数据到达前显示「正在读取研究图…」；画布对空数据防御，不因瞬时无快照而崩溃。
-  布局契约沿用宿主右侧栏页签的滚动约定（页签不自建纵向滚动容器）。
+  布局契约沿用 `docs/research/client-api.md` §5.3（页签不自建纵向滚动容器）。
 - 数据：`GET /explore-tree/workspaces` + `GET /explore-tree/snapshot?workspace=…`，
   打开时 3s 轮询；当前工作区优先会话 cwd（`props.sessionId` + `useSessions`），
   其次 `localStorage['explore-tree.workspace.<sessionId>']`，最后第一个已知工作区。
 - 全局工作区索引：`$DSH_HOME/explore-tree/workspaces.json`，供服务端 `allowsRoot` 与未来
   扩展使用；无会话时没有页签入口（`conversation.view` 作用域如此）。
-- 信任边界：端点只服务本机请求（`127.0.0.1`/`::1`），仅 GET；只允许
+- 信任边界：端点只服务本机请求（`127.0.0.1`/`::1`）；除 analyze 外仅 GET；analyze 的 GET 只读
+  配置/缓存，POST 才调模型，且 `Origin` 必须缺失或为回环地址。只允许
   `workspaceRegistry`/`GraphRegistry`/全局索引/已存在 `.explore-tree/graph.json` 的工作区，
   未知路径 404。
 
@@ -553,15 +605,18 @@ limit?（1..20）  depth?（tree/subtree 层数 1..8，默认 3）  —— 返�
 ```
 action: add|update|move|link|close|reopen|merge|promote|assign|handoff|digest|archive|rollback
 id?  parentId?（add 省略=当前焦点，''=根）  kind?  title?  summary?  status?  confidence?
-tags?  refs?  from?  to?  edgeKind?  note?  dropId?  reason?  owner?  leaseUntil?  toActor?  digest?
+tags?  refs?  closeReason?  resolutionBy?  from?  to?  edgeKind?  note?  dropId?  reason?  owner?  leaseUntil?  toActor?  digest?
 children?（add 时一次建一层子节点，≤20）
 ```
 
 - `add`：模型显式登记目标/假设/结论/死路/决策（语义判断优先于自动提取）；`children` 让「建父 + 挂子」
   一次往返完成，返回 `{id, children:[{id,kind,title}]}` 便于继续挂更深的层级。
 - `update`：只改传入字段；`move`：改父节点（禁成环）。
-- `close`：done/abandoned（死路必须写原因）；`reopen`：重新打开（死路需新理由）。
-- `link`：建旁支关系；`merge`：把 `dropId` 合并进 `id`（保留被合并指针）。
+- `close`：done（P1 同时写 closeReason/resolutionBy；question/hypothesis 必须显式 solved|dead_end；
+  其他 kind 默认 goal/topic→solved、step/action→completed、记录类→recorded、dead_end→dead_end；resolutionBy 默认 human）；
+  `reopen`：重新打开并清空两字段（死路需新理由）。
+- `link`：建旁支关系；`merge`：把 `dropId` 合并进 `id`（保留被合并指针；closeReason 默认 duplicate，
+  可指定 superseded，resolutionBy 默认 auto）。
 - `handoff`：把 topic 租约转给 `toActor` 并写交接包；旧 owner 之后的写返回 `OUT_OF_SCOPE`。
 - `assign`：认领/续租/释放；`digest`：人工摘要；`archive`/`rollback`：归档与摘要版本恢复。
 - 写操作立即改内存 → 异步 flush；UI 3s 轮询可见。
@@ -621,7 +676,7 @@ children?（add 时一次建一层子节点，≤20）
 
 ## 12. 测试与验收
 
-- 单元（`npm test`，`node --test`）：203 项 / 13 个 suite
+- 单元（`npm test`，`node --test`）：201 项 / 13 个 suite
   - `model.test.js`：枚举归一化、截断、tags/refs。
   - `graph.test.js`：增删改、移动禁环、合并、校验、序列化往返。
   - `store.test.js`：落盘恢复、journal 重放 id 一致、损坏隔离、registry 共享、原子写。
@@ -676,3 +731,5 @@ children?（add 时一次建一层子节点，≤20）
   「临时文件 + rename」。
 - **服务缺失**：webServer/workspaceRegistry/workingDirectory 按 optional 处理；缺失降级，
   不阻断插件加载。
+
+
